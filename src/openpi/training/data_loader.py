@@ -127,28 +127,125 @@ class FakeDataset(Dataset):
         return self._num_samples
 
 
+def _sample_truncated_geometric(max_chunks: int, decay: float, rng: np.random.Generator) -> int:
+    """Sample the number of action-chunk steps ahead from a truncated geometric distribution.
+
+    Draws ``k`` from ``P(k) ∝ decay^k`` over ``{1, …, max_chunks}`` via inverse CDF.
+    ``decay`` close to 1 gives near-uniform coverage; close to 0 always returns 1.
+    """
+    if max_chunks <= 0:
+        return 0
+    if decay >= 1.0 - 1e-9:
+        return int(rng.integers(1, max_chunks + 1))
+    # CDF: F(k) = (1 - decay^k) / (1 - decay^K)  where K = max_chunks
+    # Inverse: k = ceil(log(1 - u * (1 - decay^K)) / log(decay))
+    u = rng.random()
+    decay_pow_K = decay**max_chunks
+    arg = max(1.0 - u * (1.0 - decay_pow_K), 1e-30)
+    k = int(np.ceil(np.log(arg) / np.log(decay)))
+    return max(1, min(k, max_chunks))
+
+
+class FutureStateDataset(Dataset):
+    """Wraps a fully-transformed (normalised + padded) LeRobot dataset to add future-state sampling.
+
+    For each frame at global index ``idx`` the wrapper:
+
+    1. Retrieves the current (already-transformed) sample.
+    2. Determines the episode boundaries using ``LeRobotDataset.episode_data_index``.
+    3. Samples a future frame index that is a multiple of ``action_horizon`` steps ahead
+       and within the same episode (so the future state is always from the same trajectory).
+    4. Fetches the future frame's ``"state"`` (already normalised and padded by the
+       transform chain) and stores it as ``"future_state"`` in the returned dict.
+
+    Only supports LeRobot random-access datasets.  RLDS/DROID future-state sampling is
+    handled at the trajectory level inside :class:`DroidRldsDataset`.
+    """
+
+    def __init__(
+        self,
+        transformed_dataset: Dataset,
+        ep_from: np.ndarray,
+        ep_to: np.ndarray,
+        frame_episode_index: np.ndarray,
+        action_horizon: int,
+        config: _config.FutureStateConfig,
+        seed: int = 0,
+    ):
+        """
+        Args:
+            transformed_dataset: Fully-normalised and padded dataset to wrap.
+            ep_from: ``episode_data_index["from"]`` – first global frame index per episode.
+            ep_to: ``episode_data_index["to"]`` – exclusive-end global frame index per episode.
+            frame_episode_index: Episode index for every frame in the dataset.
+            action_horizon: Action chunk length; offsets are sampled in multiples of this.
+            config: Future-state sampling configuration.
+            seed: RNG seed (reproducibility note: does not survive multi-worker pickling).
+        """
+        self._dataset = transformed_dataset
+        self._ep_from = ep_from
+        self._ep_to = ep_to
+        self._frame_episode_index = frame_episode_index
+        self._action_horizon = action_horizon
+        self._config = config
+        self._rng = np.random.default_rng(seed)
+
+    def __getitem__(self, idx: int) -> dict:
+        idx = int(idx)
+        sample = self._dataset[idx]
+
+        ep_idx = int(self._frame_episode_index[idx])
+        # Exclude the terminal frame (ep_to - 1) from the reachable target range.
+        ep_end = int(self._ep_to[ep_idx]) - 2
+        # Number of full action-chunk steps available from this position.
+        max_chunks = (ep_end - idx) // self._action_horizon
+
+        if max_chunks <= 0:
+            # At or near episode end – reuse current state.
+            sample["future_state"] = sample["state"]
+        elif self._config.mode == "next":
+            future_idx = idx + self._action_horizon
+            sample["future_state"] = self._dataset[future_idx]["state"]
+        else:
+            num_chunks = _sample_truncated_geometric(max_chunks, self._config.decay, self._rng)
+            future_idx = idx + num_chunks * self._action_horizon
+            sample["future_state"] = self._dataset[future_idx]["state"]
+
+        return sample
+
+    def __len__(self) -> int:
+        return len(self._dataset)
+
+
 def create_torch_dataset(
     data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
-) -> Dataset:
-    """Create a dataset for training."""
+) -> tuple[Dataset, lerobot_dataset.LeRobotDataset | None]:
+    """Create a dataset for training.
+
+    Returns:
+        A ``(dataset, raw_lerobot_dataset)`` pair.  ``raw_lerobot_dataset`` is ``None``
+        for fake data and is used by :class:`FutureStateDataset` for episode-boundary
+        metadata without going through the full transform chain a second time.
+    """
     repo_id = data_config.repo_id
     if repo_id is None:
         raise ValueError("Repo ID is not set. Cannot create dataset.")
     if repo_id == "fake":
-        return FakeDataset(model_config, num_samples=1024)
+        return FakeDataset(model_config, num_samples=1024), None
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
-    dataset = lerobot_dataset.LeRobotDataset(
+    raw_lerobot = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
     )
 
+    dataset: Dataset = raw_lerobot
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
 
-    return dataset
+    return dataset, raw_lerobot
 
 
 def create_rlds_dataset(
@@ -166,20 +263,32 @@ def create_rlds_dataset(
         action_chunk_size=action_horizon,
         action_space=data_config.action_space,
         datasets=data_config.datasets,
+        future_state_config=data_config.future_state,
     )
+
+
+def _get_norm_stats(data_config: _config.DataConfig, *, skip_norm_stats: bool = False) -> dict:
+    """Return the normalization stats, raising if they are missing and required."""
+    if data_config.repo_id == "fake" or skip_norm_stats:
+        return {}
+    if data_config.norm_stats is None:
+        raise ValueError(
+            "Normalization stats not found. "
+            "Make sure to run `scripts/compute_norm_stats.py --config-name=<your-config>`."
+        )
+    norm_stats = dict(data_config.norm_stats)
+    # When future-state sampling is enabled on the RLDS path, the raw future state
+    # is injected before normalisation and must be normalised with the same stats as
+    # the current state.  (For the LeRobot path this is handled by FutureStateDataset
+    # which fetches already-normalised states, so this augmentation is a no-op there.)
+    if data_config.future_state is not None and "state" in norm_stats:
+        norm_stats["future_state"] = norm_stats["state"]
+    return norm_stats
 
 
 def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip_norm_stats: bool = False) -> Dataset:
     """Transform the dataset by applying the data transforms."""
-    norm_stats = {}
-    if data_config.repo_id != "fake" and not skip_norm_stats:
-        if data_config.norm_stats is None:
-            raise ValueError(
-                "Normalization stats not found. "
-                "Make sure to run `scripts/compute_norm_stats.py --config-name=<your-config>`."
-            )
-        norm_stats = data_config.norm_stats
-
+    norm_stats = _get_norm_stats(data_config, skip_norm_stats=skip_norm_stats)
     return TransformedDataset(
         dataset,
         [
@@ -199,15 +308,7 @@ def transform_iterable_dataset(
     is_batched: bool = False,
 ) -> IterableDataset:
     """Transform the dataset by applying the data transforms."""
-    norm_stats = {}
-    if data_config.repo_id != "fake" and not skip_norm_stats:
-        if data_config.norm_stats is None:
-            raise ValueError(
-                "Normalization stats not found. "
-                "Make sure to run `scripts/compute_norm_stats.py --config-name=<your-config>`."
-            )
-        norm_stats = data_config.norm_stats
-
+    norm_stats = _get_norm_stats(data_config, skip_norm_stats=skip_norm_stats)
     return IterableTransformedDataset(
         dataset,
         [
@@ -228,7 +329,7 @@ def create_data_loader(
     num_batches: int | None = None,
     skip_norm_stats: bool = False,
     framework: Literal["jax", "pytorch"] = "jax",
-) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
+) -> "DataLoader[tuple[_model.Observation, _model.Actions, jax.Array | None]]":
     """Create a data loader for training.
 
     Args:
@@ -281,7 +382,7 @@ def create_torch_data_loader(
     num_workers: int = 0,
     seed: int = 0,
     framework: str = "jax",
-) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
+) -> "DataLoader[tuple[_model.Observation, _model.Actions, jax.Array | None]]":
     """Create a data loader for training.
 
     Args:
@@ -299,8 +400,20 @@ def create_torch_data_loader(
             execute in the main process.
         seed: The seed to use for shuffling the data.
     """
-    dataset = create_torch_dataset(data_config, action_horizon, model_config)
-    dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
+    raw_dataset, raw_lerobot = create_torch_dataset(data_config, action_horizon, model_config)
+    dataset = transform_dataset(raw_dataset, data_config, skip_norm_stats=skip_norm_stats)
+
+    if data_config.future_state is not None and raw_lerobot is not None:
+        ep_index = raw_lerobot.episode_data_index
+        dataset = FutureStateDataset(
+            dataset,
+            ep_from=np.asarray(ep_index["from"]),
+            ep_to=np.asarray(ep_index["to"]),
+            frame_episode_index=np.asarray(raw_lerobot.hf_dataset["episode_index"]),
+            action_horizon=action_horizon,
+            config=data_config.future_state,
+            seed=seed,
+        )
 
     # Use TorchDataLoader for both frameworks
     # For PyTorch DDP, create DistributedSampler and divide batch size by world size
@@ -347,7 +460,7 @@ def create_rlds_data_loader(
     shuffle: bool = False,
     num_batches: int | None = None,
     framework: str = "jax",
-) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
+) -> "DataLoader[tuple[_model.Observation, _model.Actions, jax.Array | None]]":
     """Create an RLDS data loader for training.
 
     Note: This data loader requires some extra dependencies -- see examples/droid/README_train.md
@@ -537,4 +650,4 @@ class DataLoaderImpl(DataLoader):
 
     def __iter__(self):
         for batch in self._data_loader:
-            yield _model.Observation.from_dict(batch), batch["actions"]
+            yield _model.Observation.from_dict(batch), batch["actions"], batch.get("future_state")

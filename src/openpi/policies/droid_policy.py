@@ -71,6 +71,10 @@ class DroidInputs(transforms.DataTransformFn):
                 data["prompt"] = data["prompt"].decode("utf-8")
             inputs["prompt"] = data["prompt"]
 
+        # Pass through future_state if present (added by future-state sampling pipeline).
+        if "future_state" in data:
+            inputs["future_state"] = np.asarray(data["future_state"])
+
         return inputs
 
 

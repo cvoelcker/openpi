@@ -138,7 +138,7 @@ def train_step(
     config: _config.TrainConfig,
     rng: at.KeyArrayLike,
     state: training_utils.TrainState,
-    batch: tuple[_model.Observation, _model.Actions],
+    batch: tuple[_model.Observation, _model.Actions, ...],
 ) -> tuple[training_utils.TrainState, dict[str, at.Array]]:
     model = nnx.merge(state.model_def, state.params)
     model.train()
@@ -151,7 +151,7 @@ def train_step(
         return jnp.mean(chunked_loss)
 
     train_rng = jax.random.fold_in(rng, state.step)
-    observation, actions = batch
+    observation, actions, *_ = batch
 
     # Filter out frozen params.
     diff_state = nnx.DiffState(0, config.trainable_filter)

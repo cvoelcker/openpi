@@ -62,6 +62,29 @@ class AssetsConfig:
 
 
 @dataclasses.dataclass(frozen=True)
+class FutureStateConfig:
+    """Config for sampling a future state from the same trajectory.
+
+    Adds a ``future_state`` key to each training batch that contains the normalized
+    robot state at a future timestep drawn from the *same* episode.  This is useful
+    for goal-conditioned or offline-RL objectives that need (s, a, s') tuples.
+
+    Two sampling modes are supported:
+
+    * ``"next"`` – always picks the state exactly ``action_horizon`` steps ahead
+      (clamped to the last frame of the episode).
+    * ``"geometric"`` – samples an offset ``k ≥ 1`` from a truncated geometric
+      distribution ``P(k) ∝ decay^k`` over ``{1, …, episode_end − t}``.
+      ``decay`` close to 1 gives near-uniform coverage of all future steps;
+      ``decay`` close to 0 concentrates on the immediately-next step.
+    """
+
+    mode: Literal["next", "geometric"] = "next"
+    # Only used when mode="geometric".
+    decay: float = 0.99
+
+
+@dataclasses.dataclass(frozen=True)
 class DataConfig:
     # LeRobot repo id. If None, fake data will be created.
     repo_id: str | None = None
@@ -96,6 +119,11 @@ class DataConfig:
     action_space: droid_rlds_dataset.DroidActionSpace | None = None
     # List of datasets to sample from: name, version, weight, and optionally filter_dict_path
     datasets: Sequence[droid_rlds_dataset.RLDSDataset] = ()
+
+    # Optional config for sampling a future state from the same trajectory.
+    # When set, each batch includes a ``future_state`` array with the same shape
+    # as ``state`` (normalized, padded to model_action_dim).
+    future_state: FutureStateConfig | None = None
 
 
 class GroupFactory(Protocol):

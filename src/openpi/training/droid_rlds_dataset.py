@@ -12,10 +12,14 @@ from enum import auto
 import json
 import logging
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import tqdm
 
 import openpi.shared.download as download
+
+if TYPE_CHECKING:
+    from openpi.training.config import FutureStateConfig
 
 
 class DroidActionSpace(Enum):
@@ -44,6 +48,8 @@ class DroidRldsDataset:
         action_chunk_size: int = 16,
         # We default to joint position actions, since they allow policy evaluation in simulation.
         action_space: DroidActionSpace = DroidActionSpace.JOINT_POSITION,
+        # Optional config for future-state sampling (see FutureStateConfig docstring).
+        future_state_config: "FutureStateConfig | None" = None,
         max_loaded_steps_per_episode: int = 100,
         # Reduce this if you are running out of memory, but careful -- below ~100k shuffling is not sufficiently random.
         shuffle_buffer_size: int = 250_000,
@@ -192,6 +198,53 @@ class DroidRldsDataset:
                 return traj
 
             dataset = dataset.traj_map(chunk_actions, num_parallel_calls)
+
+            if future_state_config is not None:
+                fsc = future_state_config  # captured by closure
+
+                def add_future_state(traj):
+                    """Attach future_state to each frame before flattening.
+
+                    The offset is always a multiple of ``action_chunk_size`` so that
+                    future states align with natural chunk boundaries.  For "next" mode
+                    the offset is exactly one chunk; for "geometric" mode the number of
+                    chunks ``k`` is drawn from a truncated geometric distribution
+                    P(k) ∝ decay^k over {1, …, max_chunks_t}.
+                    """
+                    traj_len = tf.shape(traj["actions"])[0]
+                    indices = tf.range(traj_len)
+
+                    # Max number of full action-chunk steps available from each position.
+                    max_chunks = (traj_len - 1 - indices) // action_chunk_size
+
+                    if fsc.mode == "next":
+                        # Exactly one chunk ahead, clamped to episode end.
+                        num_chunks = tf.maximum(tf.minimum(1, max_chunks), 0)
+                    else:
+                        # Geometric sampling in chunk increments.
+                        # Inverse-CDF: k = ceil(log(1 - u*(1-decay^K)) / log(decay))
+                        decay_f = tf.constant(float(fsc.decay), dtype=tf.float32)
+                        max_chunks_f = tf.cast(max_chunks, tf.float32)
+                        safe_max = tf.maximum(max_chunks_f, 1.0)
+                        u = tf.random.uniform(shape=[traj_len])
+                        decay_pow = tf.pow(decay_f, safe_max)
+                        arg = tf.maximum(1.0 - u * (1.0 - decay_pow), 1e-30)
+                        raw_k = tf.math.ceil(tf.math.log(arg) / tf.math.log(decay_f))
+                        num_chunks = tf.cast(raw_k, tf.int32)
+                        num_chunks = tf.maximum(num_chunks, 1)
+                        num_chunks = tf.minimum(num_chunks, max_chunks)
+                        # At episode end (max_chunks == 0) fall back to current frame.
+                        num_chunks = tf.where(max_chunks <= 0, tf.zeros_like(num_chunks), num_chunks)
+
+                    future_indices = tf.minimum(indices + num_chunks * action_chunk_size, traj_len - 1)
+
+                    # Concatenate joint + gripper at the future index (mirrors DroidInputs state assembly).
+                    future_joint = tf.gather(traj["observation"]["joint_position"], future_indices)
+                    future_gripper = tf.gather(traj["observation"]["gripper_position"], future_indices)
+                    traj["future_state"] = tf.concat([future_joint, future_gripper], axis=-1)
+                    return traj
+
+                dataset = dataset.traj_map(add_future_state, num_parallel_calls)
 
             # Flatten: map from trajectory dataset to dataset of individual action chunks
             dataset = dataset.flatten(num_parallel_calls=num_parallel_calls)

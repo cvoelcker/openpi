@@ -119,3 +119,25 @@ def test_extract_prompt_from_task():
 
     with pytest.raises(ValueError, match="task_index=2 not found in task mapping"):
         transform({"task_index": 2})
+
+
+def test_pad_states_and_actions_pads_future_state():
+    transform = _transforms.PadStatesAndActions(model_action_dim=8)
+    item = {
+        "state": np.zeros(4),
+        "actions": np.zeros((10, 4)),
+        "future_state": np.zeros(4),
+    }
+    out = transform(item)
+    assert out["state"].shape == (8,)
+    assert out["actions"].shape == (10, 8)
+    assert out["future_state"].shape == (8,)
+
+
+def test_pad_states_and_actions_no_future_state():
+    """future_state key absent → no error, state/actions still padded."""
+    transform = _transforms.PadStatesAndActions(model_action_dim=8)
+    item = {"state": np.zeros(4), "actions": np.zeros((10, 4))}
+    out = transform(item)
+    assert "future_state" not in out
+    assert out["state"].shape == (8,)
