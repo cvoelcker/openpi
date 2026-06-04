@@ -51,7 +51,9 @@ def _bounds_from_episodes(episodes: list[tuple[int, int]]) -> tuple[np.ndarray, 
     return ep_start, ep_end
 
 
-def _make_dataset(episodes, *, gamma=0.9, future_uniform=True, seed=0) -> _rl.RandomFutureDataset:
+def _make_dataset(
+    episodes, *, gamma=0.9, future_uniform=True, seed=0, action_chunk_size=1
+) -> _rl.RandomFutureDataset:
     ep_start, ep_end = _bounds_from_episodes(episodes)
     num_frames = len(ep_start)
     return _rl.RandomFutureDataset(
@@ -59,6 +61,7 @@ def _make_dataset(episodes, *, gamma=0.9, future_uniform=True, seed=0) -> _rl.Ra
         ep_start,
         ep_end,
         sampling=_rl.GoalSamplingConfig(gamma=gamma, future_uniform=future_uniform, seed=seed),
+        action_chunk_size=action_chunk_size,
     )
 
 
@@ -113,6 +116,41 @@ def test_goal_offset_clamped_to_episode():
         _, future_idx, goal_idx, _ = ds._sample_indices(0)  # noqa: SLF001
         assert goal_idx == 5  # last frame of the single episode
         assert 0 < future_idx <= 5
+
+
+@pytest.mark.parametrize("chunk_size", [2, 3])
+def test_chunk_indices_are_chunk_aligned(chunk_size):
+    """All sampled indices must be multiples of chunk_size ahead of t."""
+    # Episode long enough to have several complete chunks.
+    episodes = [(0, 20)]
+    ds = _make_dataset(episodes, gamma=0.9, action_chunk_size=chunk_size)
+    for t in range(20):
+        for _ in range(100):
+            next_idx, future_idx, goal_idx, pads = ds._sample_indices(t)  # noqa: SLF001
+            if not pads["next_is_pad"]:
+                assert (next_idx - t) % chunk_size == 0, f"next not chunk-aligned: t={t}, next={next_idx}"
+            if not pads["future_is_pad"]:
+                assert (future_idx - t) % chunk_size == 0
+                assert (goal_idx - t) % chunk_size == 0
+                assert future_idx <= goal_idx
+
+
+@pytest.mark.parametrize("chunk_size", [2, 3])
+def test_chunk_last_chunk_frames_are_padded(chunk_size):
+    """Frames where fewer than chunk_size steps remain must have all indices padded."""
+    # Episode of length 10: frames 0-9. With chunk_size=3, frames 7,8,9 have <3 frames remaining.
+    episodes = [(0, 10)]
+    ds = _make_dataset(episodes, gamma=0.9, action_chunk_size=chunk_size)
+    for t in range(10):
+        frames_remaining = 10 - 1 - t  # frames strictly after t
+        _, _, _, pads = ds._sample_indices(t)  # noqa: SLF001
+        if frames_remaining < chunk_size:
+            assert pads["next_is_pad"], f"t={t} should have next_is_pad=True"
+            assert pads["future_is_pad"]
+            assert pads["goal_is_pad"]
+        else:
+            assert not pads["future_is_pad"], f"t={t} should have future available"
+            assert not pads["goal_is_pad"]
 
 
 def test_sampling_is_seeded_deterministic():

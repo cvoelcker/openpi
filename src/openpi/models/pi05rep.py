@@ -1,6 +1,7 @@
 import logging
 
 import einops
+import flax
 import flax.nnx as nnx
 import flax.nnx.bridge as nnx_bridge
 import jax
@@ -99,6 +100,9 @@ class Pi0(_model.BaseModel):
             self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
 
+        self.phi_token = self.param("phi_token", nnx.initializers.normal(), (1, 2048)) # TODO: hardcoded, revisit if necessary
+        self.psi_token = self.param("psi_token", nnx.initializers.normal(), (1, 2048))
+
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
 
@@ -131,6 +135,8 @@ class Pi0(_model.BaseModel):
             input_mask.append(obs.tokenized_prompt_mask)
             # full attention between image and language inputs
             ar_mask += [False] * tokenized_inputs.shape[1]
+        tokens.append(self.psi_token.broadcast_to((obs.state.shape[0], 1, self.psi_token.shape[1])))
+        ar_mask += [False]
         tokens = jnp.concatenate(tokens, axis=1)
         input_mask = jnp.concatenate(input_mask, axis=1)
         ar_mask = jnp.array(ar_mask)
@@ -177,9 +183,10 @@ class Pi0(_model.BaseModel):
             action_expert_tokens = action_time_tokens
             adarms_cond = None
         tokens.append(action_expert_tokens)
+        tokens.append(self.phi_token.broadcast_to((obs.state.shape[0], 1, self.phi_token.shape[1])))
         input_mask.append(jnp.ones(action_expert_tokens.shape[:2], dtype=jnp.bool_))
         # image/language/state inputs do not attend to action tokens
-        ar_mask += [True] + ([False] * (self.action_horizon - 1))
+        ar_mask += [True] + ([False] * (self.action_horizon + 1))
         tokens = jnp.concatenate(tokens, axis=1)
         input_mask = jnp.concatenate(input_mask, axis=1)
         ar_mask = jnp.array(ar_mask)
@@ -187,22 +194,34 @@ class Pi0(_model.BaseModel):
 
     @override
     def compute_loss(
-        self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
+        self, rng: at.KeyArrayLike, observation: _model.Observation, 
+        future_observation: _model.Observation,
+        actions: _model.Actions, 
+        future_actions: _model.Actions,
+        *, train: bool = False
     ) -> at.Float[at.Array, "*b ah"]:
         # for CRL, we need two tokens, and pass both current state and future state here
+
+        # stack current and future so we only need one forward pass
+
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
+        future_observation = _model.preprocess_observation(preprocess_rng, future_observation, train=train)
 
-        batch_shape = actions.shape[:-2]
-        noise = jax.random.normal(noise_rng, actions.shape)
+        observation_stacked = jax.tree_util.tree_map(lambda x, y: jnp.stack([x, y], axis=0), observation, future_observation)
+        actions_stacked = jax.tree_util.tree_map(lambda x, y: jnp.stack([x, y], axis=0), actions, future_actions)
+
+        orig_batch_size = actions.shape[0]
+        batch_shape = actions_stacked.shape[:-2]
+        noise = jax.random.normal(noise_rng, actions_stacked.shape)
         time = jax.random.beta(time_rng, 1.5, 1, batch_shape) * 0.999 + 0.001
         time_expanded = time[..., None, None]
-        x_t = time_expanded * noise + (1 - time_expanded) * actions
-        u_t = noise - actions
+        x_t = time_expanded * noise + (1 - time_expanded) * actions_stacked
+        u_t = noise - actions_stacked
 
         # one big forward pass of prefix + suffix at once
-        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
-        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, time)
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation_stacked)
+        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation_stacked, x_t, time)
         # add new readout token to repfix with fixed learnable vector
         # read out last entry in prefix out and apply loss there
         input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
@@ -212,11 +231,19 @@ class Pi0(_model.BaseModel):
         (prefix_out, suffix_out), _ = self.PaliGemma.llm(
             [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions, adarms_cond=[None, adarms_cond]
         )
-        v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+        v_t = self.action_out_proj(suffix_out[:, -self.action_horizon : 1])
 
-        # add CRL loss and construct matrix
+        phi = suffix_out[:orig_batch_size, -1].expand_dims(axis=0)
+        psi = prefix_out[orig_batch_size:, -1].expand_dims(axis=1)
 
-        return jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        crl_matrix = jnp.sum(phi * psi, axis=-1)
+        crl_pos = jnp.diag(crl_matrix)
+        off_diag_mask = ~jnp.eye(orig_batch_size, dtype=bool)
+        crl_neg = jnp.logsumexp(crl_matrix + jnp.where(off_diag_mask, 0.0, -jnp.finfo(crl_matrix.dtype).min), axis=1)
+        crl_reg = jnp.logsumexp(crl_matrix, axis=1)
+        crl_loss = jnp.mean(crl_neg - crl_pos + 0.01 * crl_reg)
+
+        return jnp.mean(jnp.square(v_t - u_t), axis=-1) + crl_loss
 
     @override
     def sample_actions(

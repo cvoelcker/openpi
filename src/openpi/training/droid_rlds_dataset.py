@@ -49,6 +49,11 @@ class DroidRldsDataset:
         shuffle_buffer_size: int = 250_000,
         num_parallel_reads: int = -1,  # -1 == tf.data.AUTOTUNE -- hack to not import tf at top level
         num_parallel_calls: int = -1,  # -1 == tf.data.AUTOTUNE -- hack to not import tf at top level
+        # HER (Hindsight Experience Replay) goal-conditioned sampling.
+        # When set, each frame will additionally carry next_observation, future_observation,
+        # and goal_observation sampled from the same trajectory using a geometric distribution
+        # with discount factor her_gamma. Set to None to disable.
+        her_gamma: float | None = None,
     ):
         # Import tensorflow here to not make it mandatory in case RLDS data loader is not used.
         import dlimp as dl
@@ -193,6 +198,60 @@ class DroidRldsDataset:
 
             dataset = dataset.traj_map(chunk_actions, num_parallel_calls)
 
+            # HER sampling: for each timestep t, gather next/future/goal observations from
+            # the same trajectory before flattening (so future frames are still accessible).
+            if her_gamma is not None:
+                her_gamma_val = float(her_gamma)
+
+                def add_her_samples(traj):
+                    traj_len = tf.shape(traj["actions"])[0]
+                    indices = tf.cast(tf.range(traj_len), tf.int32)
+                    C = action_chunk_size  # treat each chunk as one atomic step
+
+                    # next: frame after executing one full action chunk
+                    next_indices = tf.minimum(indices + C, traj_len - 1)
+                    next_is_pad = (indices + C) >= traj_len
+
+                    # number of full chunks reachable from each step
+                    num_chunks = (traj_len - 1 - indices) // C  # [T], in chunk units
+                    has_future = num_chunks > 0
+
+                    # goal: truncated geometric(p=1-gamma) in chunk units
+                    p = float(max(1e-6, 1.0 - her_gamma_val))
+                    u = tf.random.uniform([traj_len], dtype=tf.float64, minval=1e-10, maxval=1.0)
+                    log_1mp = tf.cast(tf.math.log(tf.constant(1.0 - p, dtype=tf.float64)), tf.float64)
+                    raw_goal_chunks = tf.cast(tf.math.ceil(tf.math.log(u) / log_1mp), tf.int32)
+                    raw_goal_chunks = tf.maximum(raw_goal_chunks, 1)
+                    goal_offset_chunks = tf.where(
+                        has_future, tf.minimum(raw_goal_chunks, num_chunks), tf.ones_like(indices)
+                    )
+                    goal_indices = indices + goal_offset_chunks * C
+
+                    # future: uniform in [1, goal_offset_chunks] chunks
+                    fu = tf.random.uniform([traj_len], dtype=tf.float32)
+                    future_offset_chunks = tf.maximum(
+                        tf.cast(fu * tf.cast(goal_offset_chunks, tf.float32), tf.int32), 1
+                    )
+                    future_offset_chunks = tf.minimum(future_offset_chunks, goal_offset_chunks)
+                    future_indices = indices + future_offset_chunks * C
+
+                    # for last-chunk frames clamp everything to t and mark as padded
+                    goal_indices = tf.where(has_future, goal_indices, indices)
+                    future_indices = tf.where(has_future, future_indices, indices)
+
+                    def gather_obs(obs, idx):
+                        return tf.nest.map_structure(lambda x: tf.gather(x, idx), obs)
+
+                    traj["next_observation"] = gather_obs(traj["observation"], next_indices)
+                    traj["future_observation"] = gather_obs(traj["observation"], future_indices)
+                    traj["goal_observation"] = gather_obs(traj["observation"], goal_indices)
+                    traj["next_is_pad"] = next_is_pad
+                    traj["future_is_pad"] = tf.logical_not(has_future)
+                    traj["goal_is_pad"] = tf.logical_not(has_future)
+                    return traj
+
+                dataset = dataset.traj_map(add_her_samples, num_parallel_calls)
+
             # Flatten: map from trajectory dataset to dataset of individual action chunks
             dataset = dataset.flatten(num_parallel_calls=num_parallel_calls)
 
@@ -209,15 +268,22 @@ class DroidRldsDataset:
 
             dataset = dataset.map(remove_passes_filter)
 
-            # Decode images: RLDS saves encoded images, only decode now for efficiency
-            def decode_images(traj):
-                traj["observation"]["image"] = tf.io.decode_image(
-                    traj["observation"]["image"], expand_animations=False, dtype=tf.uint8
-                )
-                traj["observation"]["wrist_image"] = tf.io.decode_image(
-                    traj["observation"]["wrist_image"], expand_animations=False, dtype=tf.uint8
-                )
-                return traj
+            # Decode images: RLDS saves encoded images, only decode now for efficiency.
+            # When HER is enabled, also decode images in the auxiliary observation dicts.
+            def decode_images(frame):
+                def decode_obs(obs):
+                    obs["image"] = tf.io.decode_image(obs["image"], expand_animations=False, dtype=tf.uint8)
+                    obs["wrist_image"] = tf.io.decode_image(
+                        obs["wrist_image"], expand_animations=False, dtype=tf.uint8
+                    )
+                    return obs
+
+                frame["observation"] = decode_obs(frame["observation"])
+                if her_gamma is not None:
+                    frame["next_observation"] = decode_obs(frame["next_observation"])
+                    frame["future_observation"] = decode_obs(frame["future_observation"])
+                    frame["goal_observation"] = decode_obs(frame["goal_observation"])
+                return frame
 
             return dataset.frame_map(decode_images, num_parallel_calls)
 
@@ -230,7 +296,10 @@ class DroidRldsDataset:
         weights = [dataset.weight for dataset in datasets]
 
         final_dataset = dl.DLataset.sample_from_datasets(all_datasets, weights=weights)
-        final_dataset = final_dataset.shuffle(shuffle_buffer_size)
+        # With HER, each frame holds 4× the decoded image data (one copy per obs).
+        # Scale the buffer down proportionally so it uses the same peak RAM as without HER.
+        effective_buffer = shuffle_buffer_size // 4 if her_gamma is not None else shuffle_buffer_size
+        final_dataset = final_dataset.shuffle(effective_buffer)
         final_dataset = final_dataset.batch(batch_size)
         # Note =>> Seems to reduce memory usage without affecting speed?
         final_dataset = final_dataset.with_ram_budget(1)

@@ -1,4 +1,4 @@
-"""Goal-conditioned / RL data loading on top of LeRobot datasets.
+"""Goal-conditioned / RL data loading supporting both LeRobot and RLDS/DROID datasets.
 
 This module adds HER-style (hindsight) sampling to openpi's standard data pipeline.
 For every sampled frame ``t`` (within an episode) it returns four observations:
@@ -21,10 +21,11 @@ clamped to the episode boundary (e.g. when ``t`` is the last frame and no real f
 exists) -- mask these out in your RL loss.
 
 Notes / limitations:
-- Only LeRobot (PyTorch) datasets are supported; the RLDS/DROID path is not.
-- Each sample fetches 4 frames, so image decode + transforms run ~4x per item. Use
-  ``num_workers > 0`` to parallelize. (The prompt tokenization is identical across the
-  4 frames and is the main redundant cost; can be optimized later if needed.)
+- For LeRobot datasets: each sample fetches 4 frames, so image decode + transforms run
+  ~4x per item. Use ``num_workers > 0`` to parallelize.
+- For RLDS/DROID: goal sampling is done inside the TF pipeline (before flattening) so
+  the streaming shuffle buffer still sees full trajectories. Prompt tokenization is
+  redundant across the 4 frames; can be optimized later if needed.
 """
 
 from collections.abc import Iterator
@@ -73,7 +74,11 @@ def _per_frame_episode_bounds(dataset: lerobot_dataset.LeRobotDataset) -> tuple[
 
 
 class RandomFutureDataset(_data_loader.Dataset):
-    """Wraps a (transformed) LeRobot dataset to additionally sample next/future/goal frames."""
+    """Wraps a (transformed) LeRobot dataset to additionally sample next/future/goal frames.
+
+    All temporal offsets (next, future, goal) are measured in units of ``action_chunk_size``
+    frames so that each "step" corresponds to one complete action chunk execution.
+    """
 
     def __init__(
         self,
@@ -82,11 +87,13 @@ class RandomFutureDataset(_data_loader.Dataset):
         ep_end: np.ndarray,
         *,
         sampling: GoalSamplingConfig,
+        action_chunk_size: int = 1,
     ):
         self._dataset = transformed_dataset
         self._ep_start = ep_start
         self._ep_end = ep_end
         self._sampling = sampling
+        self._action_chunk_size = action_chunk_size
         self._gen: np.random.Generator | None = None
 
     def __len__(self) -> int:
@@ -100,25 +107,25 @@ class RandomFutureDataset(_data_loader.Dataset):
             self._gen = np.random.default_rng([self._sampling.seed, worker_id])
         return self._gen
 
-    def _sample_goal_offset(self, max_offset: int, rng: np.random.Generator) -> int:
-        """Sample a goal offset d in [1, max_offset] from a truncated geometric distribution."""
+    def _sample_goal_offset_chunks(self, max_chunks: int, rng: np.random.Generator) -> int:
+        """Sample a goal offset in [1, max_chunks] chunks from a truncated geometric distribution."""
         p = max(1e-6, 1.0 - self._sampling.gamma)
         d = int(rng.geometric(p))
-        return min(max(d, 1), max_offset)
+        return min(max(d, 1), max_chunks)
 
     def _sample_indices(self, t: int) -> tuple[int, int, int, dict[str, np.bool_]]:
         ep_end = int(self._ep_end[t])
         rng = self._rng()
+        C = self._action_chunk_size
 
-        # Number of strictly-future frames available in this episode.
-        num_future = ep_end - 1 - t
+        # Number of full action chunks available after t within this episode.
+        num_chunks = (ep_end - 1 - t) // C
 
-        # Next state (clamped to episode end).
-        next_idx = min(t + 1, ep_end - 1)
-        next_is_pad = (t + 1) >= ep_end
+        # Next: the frame that follows after executing one full action chunk.
+        next_idx = min(t + C, ep_end - 1)
+        next_is_pad = (t + C) >= ep_end
 
-        if num_future <= 0:
-            # t is the last frame of its episode: no valid future. Clamp everything to t.
+        if num_chunks <= 0:
             pads = {
                 "next_is_pad": np.bool_(True),
                 "future_is_pad": np.bool_(True),
@@ -126,14 +133,14 @@ class RandomFutureDataset(_data_loader.Dataset):
             }
             return t, t, t, pads
 
-        goal_offset = self._sample_goal_offset(num_future, rng)
-        goal_idx = t + goal_offset
+        goal_offset_chunks = self._sample_goal_offset_chunks(num_chunks, rng)
+        goal_idx = t + goal_offset_chunks * C
 
         if self._sampling.future_uniform:
-            future_offset = int(rng.integers(1, goal_offset + 1))
+            future_offset_chunks = int(rng.integers(1, goal_offset_chunks + 1))
         else:
-            future_offset = self._sample_goal_offset(goal_offset, rng)
-        future_idx = t + future_offset
+            future_offset_chunks = self._sample_goal_offset_chunks(goal_offset_chunks, rng)
+        future_idx = t + future_offset_chunks * C
 
         pads = {
             "next_is_pad": np.bool_(next_is_pad),
@@ -168,7 +175,7 @@ class RandomFutureDataset(_data_loader.Dataset):
 class GoalConditionedDataLoader(_data_loader.DataLoader):
     """Yields batches of structured goal-conditioned observations."""
 
-    def __init__(self, data_config: _config.DataConfig, data_loader: _data_loader.TorchDataLoader):
+    def __init__(self, data_config: _config.DataConfig, data_loader):
         self._data_config = data_config
         self._data_loader = data_loader
 
@@ -189,6 +196,66 @@ class GoalConditionedDataLoader(_data_loader.DataLoader):
             if "actions" in batch:
                 out["actions"] = batch["actions"]
             yield out
+
+
+class IterableHERTransformedDataset(_data_loader.IterableDataset):
+    """Applies a transform pipeline to all 4 observations in an HER-structured RLDS batch.
+
+    The RLDS HER dataset yields pre-batched dicts with keys ``observation``,
+    ``next_observation``, ``future_observation``, ``goal_observation``, ``actions``,
+    ``prompt``, and ``*_is_pad`` flags.  This wrapper splits each batch into individual
+    samples, applies the transform pipeline to each of the four observations
+    independently (only the anchor gets actions), and re-stacks into a batch.
+    """
+
+    def __init__(self, dataset: _data_loader.IterableDataset, transform_fn):
+        self._dataset = dataset
+        self._transform_fn = transform_fn
+
+    def __iter__(self):
+        for batch in self._dataset:
+            leaves = jax.tree.leaves(batch)
+            if not leaves:
+                continue
+            batch_size = leaves[0].shape[0]
+            results = []
+            for i in range(batch_size):
+                sample = jax.tree.map(lambda x: x[i], batch)  # noqa: B023
+                results.append(self._transform_sample(sample))
+            yield jax.tree.map(lambda *xs: np.stack([np.asarray(x) for x in xs], axis=0), *results)
+
+    def _transform_sample(self, sample: dict) -> dict:
+        prompt = sample.get("prompt")
+
+        def _build_obs_input(obs_dict, *, include_actions: bool) -> dict:
+            inp = {"observation": obs_dict}
+            if prompt is not None:
+                inp["prompt"] = prompt
+            if include_actions:
+                inp["actions"] = sample["actions"]
+            return inp
+
+        anchor_out = self._transform_fn(_build_obs_input(sample["observation"], include_actions=True))
+        actions = anchor_out.pop("actions", None)
+
+        def _transform_aux(obs_dict) -> dict:
+            return self._transform_fn(_build_obs_input(obs_dict, include_actions=False))
+
+        result = {
+            "observation": anchor_out,
+            "next_observation": _transform_aux(sample["next_observation"]),
+            "future_observation": _transform_aux(sample["future_observation"]),
+            "goal_observation": _transform_aux(sample["goal_observation"]),
+            "next_is_pad": sample["next_is_pad"],
+            "future_is_pad": sample["future_is_pad"],
+            "goal_is_pad": sample["goal_is_pad"],
+        }
+        if actions is not None:
+            result["actions"] = actions
+        return result
+
+    def __len__(self) -> int:
+        return len(self._dataset)
 
 
 def create_goal_conditioned_data_loader(
@@ -225,7 +292,16 @@ def create_goal_conditioned_data_loader(
     logger.info(f"data_config: {data_config}")
 
     if data_config.rlds_data_dir is not None:
-        raise NotImplementedError("Goal-conditioned sampling is only supported for LeRobot datasets, not RLDS.")
+        return _create_goal_conditioned_rlds_data_loader(
+            config,
+            data_config,
+            sampling=sampling,
+            sharding=sharding,
+            shuffle=shuffle,
+            num_batches=num_batches,
+            skip_norm_stats=skip_norm_stats,
+        )
+
     if data_config.repo_id is None:
         raise ValueError("Repo ID is not set. Cannot create dataset.")
     if data_config.repo_id == "fake":
@@ -252,7 +328,7 @@ def create_goal_conditioned_data_loader(
     transformed = _data_loader.transform_dataset(base_dataset, data_config, skip_norm_stats=skip_norm_stats)
 
     ep_start, ep_end = _per_frame_episode_bounds(raw_dataset)
-    dataset = RandomFutureDataset(transformed, ep_start, ep_end, sampling=sampling)
+    dataset = RandomFutureDataset(transformed, ep_start, ep_end, sampling=sampling, action_chunk_size=action_horizon)
 
     local_batch_size = config.batch_size // jax.process_count()
     logger.info(f"local_batch_size: {local_batch_size}")
@@ -268,3 +344,60 @@ def create_goal_conditioned_data_loader(
     )
 
     return GoalConditionedDataLoader(data_config, torch_loader)
+
+
+def _create_goal_conditioned_rlds_data_loader(
+    config: _config.TrainConfig,
+    data_config: _config.DataConfig,
+    *,
+    sampling: GoalSamplingConfig,
+    sharding: jax.sharding.Sharding | None,
+    shuffle: bool,
+    num_batches: int | None,
+    skip_norm_stats: bool,
+) -> GoalConditionedDataLoader:
+    """RLDS/DROID path for goal-conditioned data loading.
+
+    HER sampling is performed inside the TF pipeline (before trajectory flattening)
+    so that future frames remain accessible while still benefiting from the streaming
+    shuffle buffer.
+    """
+    from openpi.training.droid_rlds_dataset import DroidRldsDataset
+
+    rlds_dataset = DroidRldsDataset(
+        data_dir=data_config.rlds_data_dir,
+        batch_size=config.batch_size,
+        datasets=data_config.datasets,
+        shuffle=shuffle,
+        action_chunk_size=config.model.action_horizon,
+        action_space=data_config.action_space,
+        her_gamma=sampling.gamma,
+    )
+
+    norm_stats: dict = {}
+    if not skip_norm_stats:
+        if data_config.norm_stats is None:
+            raise ValueError(
+                "Normalization stats not found. "
+                "Make sure to run `scripts/compute_norm_stats.py --config-name=<your-config>`."
+            )
+        norm_stats = data_config.norm_stats
+
+    transform_fn = _transforms.compose(
+        [
+            *data_config.repack_transforms.inputs,
+            *data_config.data_transforms.inputs,
+            _transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
+            *data_config.model_transforms.inputs,
+        ]
+    )
+
+    her_dataset = IterableHERTransformedDataset(rlds_dataset, transform_fn)
+
+    rlds_loader = _data_loader.RLDSDataLoader(
+        her_dataset,
+        sharding=sharding,
+        num_batches=num_batches,
+    )
+
+    return GoalConditionedDataLoader(data_config, rlds_loader)
