@@ -100,8 +100,11 @@ class Pi0(_model.BaseModel):
             self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
 
-        self.phi_token = nnx.Param(jax.random.uniform(rngs.params(), (1, 2048)) / 2048.)  # TODO: hardcoded, revisit if necessary
-        self.psi_token = nnx.Param(jax.random.uniform(rngs.params(), (1, 2048)) / 2048.)  # TODO: hardcoded, revisit if necessary
+        # prefix and suffix have differing embedding dimensions, which is going to cause some problem? We might need to project one up or down to match?
+        self.phi_token = nnx.Param(jax.random.uniform(rngs.params(), (1, action_expert_config.width)) / action_expert_config.width)
+        self.psi_token = nnx.Param(jax.random.uniform(rngs.params(), (1, paligemma_config.width)) / paligemma_config.width)
+        # assumes phi is smaller than psi, which is correct for default PI setup
+        self.psi_proj = nnx.Linear(paligemma_config.width, action_expert_config.width, rngs=rngs)
 
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
@@ -187,8 +190,8 @@ class Pi0(_model.BaseModel):
         tokens.append(jnp.broadcast_to(self.phi_token.value[None], (obs.state.shape[0], 1, self.phi_token.value.shape[-1])))
         input_mask.append(jnp.ones(action_expert_tokens.shape[:2], dtype=jnp.bool_))
         input_mask.append(jnp.ones((obs.state.shape[0], 1), dtype=jnp.bool_))
-        # image/language/state inputs do not attend to action tokens
-        ar_mask += [True] + ([False] * self.action_horizon)
+        # image/language/state inputs do not attend to action tokens or phi; phi attends to everything in the suffix
+        ar_mask += [True] + ([False] * (self.action_horizon - 1)) + [True]
         tokens = jnp.concatenate(tokens, axis=1)
         input_mask = jnp.concatenate(input_mask, axis=1)
         ar_mask = jnp.array(ar_mask)
@@ -227,6 +230,9 @@ class Pi0(_model.BaseModel):
         input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
         ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
         attn_mask = make_attn_mask(input_mask, ar_mask)
+        # psi_token is the last prefix token; block suffix tokens from attending to it
+        prefix_len = prefix_tokens.shape[1]
+        attn_mask = attn_mask.at[:, prefix_len:, prefix_len - 1].set(False)
         positions = jnp.cumsum(input_mask, axis=1) - 1
         (prefix_out, suffix_out), _ = self.PaliGemma.llm(
             [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions, adarms_cond=[None, adarms_cond]
@@ -237,14 +243,15 @@ class Pi0(_model.BaseModel):
         action_loss = jnp.mean(jnp.square(v_t - u_t[:orig_batch_size]), axis=-1)
 
         # CRL: phi from current suffix, psi from future prefix.
-        phi = suffix_out[:orig_batch_size, -1].expand_dims(axis=0)  # (1, B, emb)
-        psi = prefix_out[orig_batch_size:, -1].expand_dims(axis=1)  # (B, 1, emb)
+        phi = jnp.expand_dims(suffix_out[:orig_batch_size, -1], axis=0)  # (1, B, emb)
+        psi = jnp.expand_dims(prefix_out[orig_batch_size:, -1], axis=1)  # (B, 1, emb)
+        psi = self.psi_proj(psi)
 
         crl_matrix = jnp.sum(phi * psi, axis=-1)
         crl_pos = jnp.diag(crl_matrix)
         off_diag_mask = ~jnp.eye(orig_batch_size, dtype=bool)
-        crl_neg = jnp.logsumexp(crl_matrix + jnp.where(off_diag_mask, 0.0, -jnp.finfo(crl_matrix.dtype).min), axis=1)
-        crl_reg = jnp.logsumexp(crl_matrix, axis=1)
+        crl_neg = jax.nn.logsumexp(crl_matrix + jnp.where(off_diag_mask, 0.0, -jnp.finfo(crl_matrix.dtype).min), axis=1)
+        crl_reg = jax.nn.logsumexp(crl_matrix, axis=1)
         crl_loss = jnp.mean(crl_neg - crl_pos + 0.01 * crl_reg)
 
         return action_loss + crl_loss
@@ -283,6 +290,8 @@ class Pi0(_model.BaseModel):
             # `prefix_attn_mask` is shape (b, suffix_len, prefix_len) indicating how the suffix tokens can attend to the
             # prefix tokens
             prefix_attn_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
+            # block suffix tokens from attending to psi_token (last prefix token)
+            prefix_attn_mask = prefix_attn_mask.at[:, :, prefix_tokens.shape[1] - 1].set(False)
             # `combined_mask` is shape (b, suffix_len, prefix_len + suffix_len) indicating how the suffix tokens (which
             # generate the queries) can attend to the full prefix + suffix sequence (which generates the keys and values)
             full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
