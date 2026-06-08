@@ -13,6 +13,7 @@ import openpi.shared.nnx_utils as nnx_utils
 
 if TYPE_CHECKING:
     from openpi.models.pi0 import Pi0
+    from openpi.models.pi05rep import Pi0 as Pi0Rep
 
 
 @dataclasses.dataclass(frozen=True)
@@ -115,3 +116,20 @@ class Pi0Config(_model.BaseModelConfig):
         if not filters:
             return nnx.Nothing
         return nnx.All(*filters)
+
+
+@dataclasses.dataclass(frozen=True)
+class Pi0RepConfig(Pi0Config):
+    """Config for the CRL representation-learning variant of Pi0.
+
+    Identical architecture to Pi0Config (pi05=True by default) but instantiates
+    pi05rep.Pi0, which adds phi/psi readout tokens for contrastive RL training.
+    """
+
+    pi05: bool = True
+
+    @override
+    def create(self, rng: at.KeyArrayLike) -> "Pi0Rep":
+        from openpi.models.pi05rep import Pi0 as Pi0Rep
+
+        return Pi0Rep(self, rngs=nnx.Rngs(rng))

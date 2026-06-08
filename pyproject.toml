@@ -38,6 +38,8 @@ dependencies = [
     "transformers==4.53.2",
     "rich>=14.0.0",
     "polars>=1.30.0",
+    "dlimp>=0.0.1",
+    "py-spy>=0.4.2",
 ]
 
 

@@ -2,6 +2,7 @@ import dataclasses
 import functools
 import logging
 import platform
+import time
 from typing import Any
 
 import etils.epath as epath
@@ -223,7 +224,11 @@ def main(config: _config.TrainConfig):
         shuffle=True,
     )
     data_iter = iter(data_loader)
+    logging.info("About to fetch first batch from data loader...")
+    t0 = time.time()
     batch = next(data_iter)
+    t1 = time.time()
+    logging.info("Fetched first batch in %.3f s", t1 - t0)
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
 
     # Log images from first batch to sanity check.

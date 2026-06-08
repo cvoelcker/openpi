@@ -31,6 +31,7 @@ Notes / limitations:
 from collections.abc import Iterator
 import dataclasses
 import logging
+from typing import TypedDict
 
 import jax
 import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
@@ -38,9 +39,21 @@ import numpy as np
 import torch
 
 import openpi.models.model as _model
+import openpi.shared.array_typing as at
 import openpi.training.config as _config
 from openpi.training import data_loader as _data_loader
 import openpi.transforms as _transforms
+
+
+class GoalConditionedBatch(TypedDict, total=False):
+    observation: _model.Observation
+    next_observation: _model.Observation
+    future_observation: _model.Observation
+    goal_observation: _model.Observation
+    actions: at.Float[at.Array, "*b ah ad"]
+    next_is_pad: at.Array
+    future_is_pad: at.Array
+    goal_is_pad: at.Array
 
 logger = logging.getLogger(__name__)
 
@@ -208,9 +221,10 @@ class IterableHERTransformedDataset(_data_loader.IterableDataset):
     independently (only the anchor gets actions), and re-stacks into a batch.
     """
 
-    def __init__(self, dataset: _data_loader.IterableDataset, transform_fn):
+    def __init__(self, dataset: _data_loader.IterableDataset, transform_fn, aux_transform_fn=None):
         self._dataset = dataset
         self._transform_fn = transform_fn
+        self._aux_transform_fn = aux_transform_fn if aux_transform_fn is not None else transform_fn
 
     def __iter__(self):
         for batch in self._dataset:
@@ -239,7 +253,7 @@ class IterableHERTransformedDataset(_data_loader.IterableDataset):
         actions = anchor_out.pop("actions", None)
 
         def _transform_aux(obs_dict) -> dict:
-            return self._transform_fn(_build_obs_input(obs_dict, include_actions=False))
+            return self._aux_transform_fn(_build_obs_input(obs_dict, include_actions=False))
 
         result = {
             "observation": anchor_out,
@@ -392,7 +406,23 @@ def _create_goal_conditioned_rlds_data_loader(
         ]
     )
 
-    her_dataset = IterableHERTransformedDataset(rlds_dataset, transform_fn)
+    # Aux observations (next/future/goal) carry no actions, so strip "actions" from
+    # the repack structure to avoid a KeyError inside RepackTransform.
+    def _strip_actions(t):
+        if isinstance(t, _transforms.RepackTransform) and isinstance(t.structure, dict):
+            return dataclasses.replace(t, structure={k: v for k, v in t.structure.items() if k != "actions"})
+        return t
+
+    aux_transform_fn = _transforms.compose(
+        [
+            *[_strip_actions(t) for t in data_config.repack_transforms.inputs],
+            *data_config.data_transforms.inputs,
+            _transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
+            *data_config.model_transforms.inputs,
+        ]
+    )
+
+    her_dataset = IterableHERTransformedDataset(rlds_dataset, transform_fn, aux_transform_fn)
 
     rlds_loader = _data_loader.RLDSDataLoader(
         her_dataset,

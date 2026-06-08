@@ -13,9 +13,26 @@ import json
 import logging
 from pathlib import Path
 
+import os
+import time
+from contextlib import contextmanager
+
 import tqdm
 
 import openpi.shared.download as download
+
+# Enable extra TF-side debug mapping when this env var is set.
+DEBUG_RLDS = os.environ.get("OPENPI_RLDS_DEBUG") == "1"
+
+
+@contextmanager
+def log_stage(name: str):
+    t0 = time.time()
+    logging.info("[RLDS DEBUG] Stage start: %s", name)
+    try:
+        yield
+    finally:
+        logging.info("[RLDS DEBUG] Stage done: %s (%.3fs)", name, time.time() - t0)
 
 
 class DroidActionSpace(Enum):
@@ -102,15 +119,16 @@ class DroidRldsDataset:
                 keys_tensor = []
                 values_tensor = []
 
-                for episode_key, ranges in tqdm.tqdm(filter_dict.items(), desc="Creating idle filter hash table..."):
-                    for start, end in ranges:
-                        for t in range(start, end):
-                            frame_key = f"{episode_key}--{t}"
-                            keys_tensor.append(frame_key)
-                            values_tensor.append(True)
-                self.filter_table = tf.lookup.StaticHashTable(
-                    tf.lookup.KeyValueTensorInitializer(keys_tensor, values_tensor), default_value=False
-                )
+                with log_stage("build_idle_filter"):
+                    for episode_key, ranges in tqdm.tqdm(filter_dict.items(), desc="Creating idle filter hash table..."):
+                        for start, end in ranges:
+                            for t in range(start, end):
+                                frame_key = f"{episode_key}--{t}"
+                                keys_tensor.append(frame_key)
+                                values_tensor.append(True)
+                    self.filter_table = tf.lookup.StaticHashTable(
+                        tf.lookup.KeyValueTensorInitializer(keys_tensor, values_tensor), default_value=False
+                    )
                 logging.info("Filter hash table initialized")
             else:
                 self.filter_table = tf.lookup.StaticHashTable(
@@ -278,11 +296,42 @@ class DroidRldsDataset:
                     )
                     return obs
 
-                frame["observation"] = decode_obs(frame["observation"])
+                # Some versions of the TF/DL pipeline may pass a non-dict (tuple/tensor)
+                # to this function during tracing. Try dict-style access first and
+                # fall back to tuple-style indexing if that fails.
+                try:
+                    frame_ob = frame["observation"]
+                except Exception:
+                    # Fall back: assume observation is first element
+                    try:
+                        frame_ob = frame[0]
+                    except Exception:
+                        frame_ob = frame
+
+                frame_ob = decode_obs(frame_ob)
+
+                # Reassign back into frame. If frame supports string keys, use them,
+                # otherwise try tuple/list assignment where possible.
+                try:
+                    frame["observation"] = frame_ob
+                except Exception:
+                    try:
+                        # convert to list to allow assignment if it's a tuple
+                        f_list = list(frame)
+                        f_list[0] = frame_ob
+                        frame = tuple(f_list)
+                    except Exception:
+                        # give up and return the decoded observation as-is
+                        return frame_ob
+
                 if her_gamma is not None:
-                    frame["next_observation"] = decode_obs(frame["next_observation"])
-                    frame["future_observation"] = decode_obs(frame["future_observation"])
-                    frame["goal_observation"] = decode_obs(frame["goal_observation"])
+                    try:
+                        frame["next_observation"] = decode_obs(frame["next_observation"])
+                        frame["future_observation"] = decode_obs(frame["future_observation"])
+                        frame["goal_observation"] = decode_obs(frame["goal_observation"])
+                    except Exception:
+                        # ignore failures in the fallback path
+                        pass
                 return frame
 
             return dataset.frame_map(decode_images, num_parallel_calls)
@@ -292,21 +341,24 @@ class DroidRldsDataset:
         for dataset in datasets:
             logging.info(f"    {dataset.name}:{dataset.version} with weight {dataset.weight:.2f}")
         logging.info("-" * 50)
-        all_datasets = [prepare_single_dataset(dataset) for dataset in datasets]
+
+        with log_stage("prepare_all_datasets"):
+            all_datasets = [prepare_single_dataset(dataset) for dataset in datasets]
         weights = [dataset.weight for dataset in datasets]
 
-        final_dataset = dl.DLataset.sample_from_datasets(all_datasets, weights=weights)
-        # With HER, each frame holds 4× the decoded image data (one copy per obs).
-        # Scale the buffer down proportionally so it uses the same peak RAM as without HER.
-        effective_buffer = shuffle_buffer_size // 4 if her_gamma is not None else shuffle_buffer_size
-        final_dataset = final_dataset.shuffle(effective_buffer)
-        final_dataset = final_dataset.batch(batch_size)
-        # Note =>> Seems to reduce memory usage without affecting speed?
-        final_dataset = final_dataset.with_ram_budget(1)
+        with log_stage("finalize_dataset"):
+            final_dataset = dl.DLataset.sample_from_datasets(all_datasets, weights=weights)
+            # With HER, each frame holds 4× the decoded image data (one copy per obs).
+            # Scale the buffer down proportionally so it uses the same peak RAM as without HER.
+            effective_buffer = shuffle_buffer_size // 4 if her_gamma is not None else shuffle_buffer_size
+            final_dataset = final_dataset.shuffle(effective_buffer)
+            final_dataset = final_dataset.batch(batch_size)
+            # Note =>> Seems to reduce memory usage without affecting speed?
+            # final_dataset = final_dataset.with_ram_budget(1)
 
-        self.dataset = final_dataset
-        self.batch_size = batch_size
-        self.shuffle = shuffle
+            self.dataset = final_dataset
+            self.batch_size = batch_size
+            self.shuffle = shuffle
 
     def __iter__(self):
         yield from self.dataset.as_numpy_iterator()
