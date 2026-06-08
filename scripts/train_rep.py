@@ -166,8 +166,8 @@ def train_step(
         future_observation: _model.Observation,
         actions: _model.Actions,
     ):
-        chunked_loss = model.compute_loss(rng, observation, future_observation, actions, train=True)
-        return jnp.mean(chunked_loss)
+        chunked_loss, log_dict = model.compute_loss(rng, observation, future_observation, actions, train=True)
+        return jnp.mean(chunked_loss), log_dict
 
     train_rng = jax.random.fold_in(rng, state.step)
     observation = batch["observation"]
@@ -176,7 +176,7 @@ def train_step(
 
     # Filter out frozen params.
     diff_state = nnx.DiffState(0, config.trainable_filter)
-    loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(
+    ((loss, grads), log_dict) = nnx.value_and_grad(loss_fn, argnums=diff_state, has_aux=True)(
         model, train_rng, observation, future_observation, actions
     )
 
@@ -210,6 +210,8 @@ def train_step(
         "loss": loss,
         "grad_norm": optax.global_norm(grads),
         "param_norm": optax.global_norm(kernel_params),
+        "action_loss": log_dict["action_loss"],
+        "rep_loss": log_dict["rep_loss"],
     }
     return new_state, info
 
