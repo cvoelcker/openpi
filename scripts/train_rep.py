@@ -176,7 +176,7 @@ def train_step(
 
     # Filter out frozen params.
     diff_state = nnx.DiffState(0, config.trainable_filter)
-    ((loss, grads), log_dict) = nnx.value_and_grad(loss_fn, argnums=diff_state, has_aux=True)(
+    ((loss, log_dict), grads) = nnx.value_and_grad(loss_fn, argnums=diff_state, has_aux=True)(
         model, train_rng, observation, future_observation, actions
     )
 

@@ -12,6 +12,7 @@ import etils.epath as epath
 import flax.nnx as nnx
 from typing_extensions import override
 import tyro
+import os
 
 import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
@@ -877,7 +878,7 @@ _CONFIGS = [
         data=RLDSDroidDataConfig(
             repo_id="droid",
             # Set this to the path to your DROID RLDS dataset (the parent directory of the `droid` directory).
-            rlds_data_dir="/datastor1/droid/",
+            rlds_data_dir=os.getenv("SCRATCH") + "/.cache/droid/",
             action_space=droid_rlds_dataset.DroidActionSpace.JOINT_POSITION,
             assets=AssetsConfig(
                 assets_dir="gs://openpi-assets/checkpoints/pi05_base/assets/",
@@ -921,7 +922,7 @@ _CONFIGS = [
         data=RLDSDroidDataConfig(
             repo_id="droid_100",
             # Set this to the path to your DROID RLDS dataset (the parent directory of the `droid` directory).
-            rlds_data_dir="/datastor1/droid/",
+            rlds_data_dir=os.getenv("SCRATCH") + "/.cache/droid/",
             action_space=droid_rlds_dataset.DroidActionSpace.JOINT_POSITION,
             assets=AssetsConfig(
                 assets_dir="gs://openpi-assets/checkpoints/pi05_base/assets/",
@@ -936,7 +937,7 @@ _CONFIGS = [
             decay_lr=5e-5,
         ),
         num_train_steps=100_000,
-        batch_size=256,
+        batch_size=64,
         log_interval=100,
         save_interval=5000,
         keep_period=10_000,
