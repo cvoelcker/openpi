@@ -944,6 +944,41 @@ _CONFIGS = [
         num_workers=0,  # Important: RLDS DataLoader requires num_workers=0, handles multi-processing internally
     ),
     TrainConfig(
+        # Full-parameter fine-tuning on the DROID-100 subset using 8-way FSDP.
+        # This is the non-LoRA counterpart to `pi05_100_droid_finetune` and is
+        # intended to fit on a single node with 8x64GB GPUs.
+        name="pi05_100_droid_full_finetune_8",
+        model=pi0_config.Pi0RepConfig(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+        ),
+        data=RLDSDroidDataConfig(
+            repo_id="droid_100",
+            # Set this to the path to your DROID RLDS dataset (the parent directory of the `droid` directory).
+            rlds_data_dir=os.getenv("SCRATCH") + "/.cache/droid/",
+            action_space=droid_rlds_dataset.DroidActionSpace.JOINT_POSITION,
+            assets=AssetsConfig(
+                assets_dir="gs://openpi-assets/checkpoints/pi05_base/assets/",
+                asset_id="droid",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        num_train_steps=100_000,
+        batch_size=128,
+        log_interval=100,
+        save_interval=5000,
+        keep_period=10_000,
+        num_workers=0,  # Important: RLDS DataLoader requires num_workers=0, handles multi-processing internally
+        fsdp_devices=8,
+    ),
+    TrainConfig(
         # This config is for fine-tuning pi05-DROID on a custom (smaller) DROID dataset.
         # Here, we use LeRobot data format (like for all other fine-tuning examples)
         # To convert your custom DROID dataset (<10s of hours) to LeRobot format, see examples/droid/convert_droid_data_to_lerobot.py
