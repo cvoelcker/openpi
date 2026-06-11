@@ -386,6 +386,9 @@ def _create_goal_conditioned_rlds_data_loader(
         action_chunk_size=config.model.action_horizon,
         action_space=data_config.action_space,
         her_gamma=sampling.gamma,
+        num_parallel_reads=data_config.rlds_num_parallel_reads,
+        num_parallel_calls=data_config.rlds_num_parallel_calls,
+        shuffle_buffer_size=data_config.rlds_shuffle_buffer_size,
     )
 
     norm_stats: dict = {}

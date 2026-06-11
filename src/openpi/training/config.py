@@ -97,6 +97,12 @@ class DataConfig:
     action_space: droid_rlds_dataset.DroidActionSpace | None = None
     # List of datasets to sample from: name, version, weight, and optionally filter_dict_path
     datasets: Sequence[droid_rlds_dataset.RLDSDataset] = ()
+    # Number of files read in parallel by the RLDS loader. -1 == tf.data.AUTOTUNE.
+    rlds_num_parallel_reads: int = -1
+    # Number of map calls run in parallel by the RLDS loader. -1 == tf.data.AUTOTUNE.
+    rlds_num_parallel_calls: int = -1
+    # Size of the shuffle buffer used by the RLDS loader (in elements, before any HER scaling).
+    rlds_shuffle_buffer_size: int = 250_000
 
 
 class GroupFactory(Protocol):
@@ -371,6 +377,16 @@ class RLDSDroidDataConfig(DataConfigFactory):
     # Set to False to disable all per-dataset filter_dict_path values (useful for debugging).
     filter: bool = True
 
+    # Number of files read in parallel by the RLDS loader. -1 == tf.data.AUTOTUNE.
+    # Lower this (e.g. to a small fixed number) if the loader runs out of memory on large
+    # datasets like the full DROID dataset.
+    num_parallel_reads: int = -1
+    # Number of map calls run in parallel by the RLDS loader. -1 == tf.data.AUTOTUNE.
+    num_parallel_calls: int = -1
+    # Size of the shuffle buffer used by the RLDS loader (in elements, before any HER scaling).
+    # Lower this if the loader runs out of memory on large datasets like the full DROID dataset.
+    shuffle_buffer_size: int = 250_000
+
     # List of datasets to sample from: name, version, weight, and optionally filter_dict_path
     datasets: Sequence[droid_rlds_dataset.RLDSDataset] = (
         droid_rlds_dataset.RLDSDataset(
@@ -427,6 +443,9 @@ class RLDSDroidDataConfig(DataConfigFactory):
             rlds_data_dir=self.rlds_data_dir,
             action_space=self.action_space,
             datasets=datasets,
+            rlds_num_parallel_reads=self.num_parallel_reads,
+            rlds_num_parallel_calls=self.num_parallel_calls,
+            rlds_shuffle_buffer_size=self.shuffle_buffer_size,
         )
 
 

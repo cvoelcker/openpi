@@ -516,6 +516,7 @@ class RLDSDataLoader:
         num_items = 0
         while True:
             data_iter = iter(self._dataset)
+            yielded_this_pass = False
             while True:
                 if self._num_batches is not None and num_items >= self._num_batches:
                     return
@@ -523,8 +524,16 @@ class RLDSDataLoader:
                     batch = next(data_iter)
                 except StopIteration:
                     break  # We've exhausted the dataset. Create a new iterator and start over.
+                yielded_this_pass = True
                 num_items += 1
                 yield jax.tree.map(lambda x: jax.make_array_from_process_local_data(self._sharding, x), batch)
+
+            if not yielded_this_pass:
+                raise RuntimeError(
+                    "The DROID RLDS dataset produced no batches. This usually means the configured "
+                    "filters (e.g. `filter_dict_path` or the success-trajectory filter) removed all "
+                    "data, or the dataset/version in `datasets` doesn't match the data on disk."
+                )
 
 
 class DataLoaderImpl(DataLoader):
