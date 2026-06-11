@@ -250,7 +250,7 @@ class Pi0(_model.BaseModel):
         crl_matrix = jnp.sum(phi * psi, axis=-1)
         crl_pos = jnp.diag(crl_matrix)
         off_diag_mask = ~jnp.eye(orig_batch_size, dtype=bool)
-        crl_neg = jax.nn.logsumexp(crl_matrix + jnp.where(off_diag_mask, 0.0, jnp.finfo(crl_matrix.dtype).min), axis=1)
+        crl_neg = jax.nn.logsumexp(crl_matrixi, axis=1)  # + jnp.where(off_diag_mask, 0.0, jnp.finfo(crl_matrix.dtype).min), axis=1)
         crl_reg = jax.nn.logsumexp(crl_matrix, axis=1)
         crl_loss = jnp.mean(crl_neg - crl_pos + 0.01 * crl_reg)
 
