@@ -11,7 +11,6 @@ from enum import Enum
 from enum import auto
 import json
 import logging
-from pathlib import Path
 
 import os
 import time
@@ -48,6 +47,53 @@ class RLDSDataset:
     version: str
     weight: float
     filter_dict_path: str | None = None
+
+
+def build_filter_table(filter_dict_path: str, tf):
+    """Build (or load from a disk cache) the StaticHashTable of allowed frame keys.
+
+    The filter dict maps each episode key to ranges of frames to keep. Expanding
+    those ranges into one key per kept frame produces tens of millions of entries
+    for full DROID; doing it in a Python loop is slow and allocates a large list
+    of Python ``str`` objects every run. We expand once, serialize the resulting
+    string tensor next to the downloaded JSON, and reload it on subsequent runs.
+
+    The cache file name embeds the JSON's size and mtime, so a re-downloaded /
+    changed filter dict transparently invalidates the cache.
+    """
+    cached_json_path = download.maybe_download(filter_dict_path)
+    stat = cached_json_path.stat()
+    cache_path = cached_json_path.with_name(
+        f"{cached_json_path.name}.keys-{stat.st_size}-{stat.st_mtime_ns}.tftensor"
+    )
+
+    if cache_path.exists():
+        with log_stage("load_filter_keys_cache"):
+            keys_tensor = tf.io.parse_tensor(tf.io.read_file(str(cache_path)), out_type=tf.string)
+    else:
+        with log_stage("build_filter_keys"):
+            with cached_json_path.open("r") as f:
+                filter_dict = json.load(f)
+            logging.info(f"Building filter keys for {len(filter_dict)} episodes")
+            keys: list[str] = []
+            for episode_key, ranges in tqdm.tqdm(filter_dict.items(), desc="Expanding filter ranges..."):
+                for start, end in ranges:
+                    keys.extend(f"{episode_key}--{t}" for t in range(start, end))
+            keys_tensor = tf.constant(keys, dtype=tf.string)
+            del keys
+        with log_stage("write_filter_keys_cache"):
+            # Write atomically so an interrupted run never leaves a corrupt cache.
+            tmp_path = cache_path.with_name(cache_path.name + ".tmp")
+            tf.io.write_file(str(tmp_path), tf.io.serialize_tensor(keys_tensor))
+            os.replace(tmp_path, cache_path)
+
+    num_keys = int(tf.shape(keys_tensor)[0])
+    logging.info(f"Filter table contains {num_keys} frame keys")
+    # Values are uniformly True; reconstruct them rather than storing a second tensor.
+    values_tensor = tf.ones([num_keys], dtype=tf.bool)
+    return tf.lookup.StaticHashTable(
+        tf.lookup.KeyValueTensorInitializer(keys_tensor, values_tensor), default_value=False
+    )
 
 
 class DroidRldsDataset:
@@ -117,24 +163,7 @@ class DroidRldsDataset:
 
             filter_dict_path = dataset_cfg.filter_dict_path
             if filter_dict_path is not None:
-                cached_filter_dict_path = download.maybe_download(filter_dict_path)
-                with Path(cached_filter_dict_path).open("r") as f:
-                    filter_dict = json.load(f)
-                logging.info(f"Using filter dictionary with {len(filter_dict)} episodes")
-
-                keys_tensor = []
-                values_tensor = []
-
-                with log_stage("build_idle_filter"):
-                    for episode_key, ranges in tqdm.tqdm(filter_dict.items(), desc="Creating idle filter hash table..."):
-                        for start, end in ranges:
-                            for t in range(start, end):
-                                frame_key = f"{episode_key}--{t}"
-                                keys_tensor.append(frame_key)
-                                values_tensor.append(True)
-                    self.filter_table = tf.lookup.StaticHashTable(
-                        tf.lookup.KeyValueTensorInitializer(keys_tensor, values_tensor), default_value=False
-                    )
+                self.filter_table = build_filter_table(filter_dict_path, tf)
                 logging.info("Filter hash table initialized")
             else:
                 self.filter_table = tf.lookup.StaticHashTable(

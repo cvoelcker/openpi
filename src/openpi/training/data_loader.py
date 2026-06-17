@@ -166,6 +166,12 @@ def create_rlds_dataset(
         action_chunk_size=action_horizon,
         action_space=data_config.action_space,
         datasets=data_config.datasets,
+        shuffle_buffer_size=data_config.rlds_shuffle_buffer_size,
+        num_parallel_reads=data_config.rlds_num_parallel_reads,
+        num_parallel_calls=data_config.rlds_num_parallel_calls,
+        include_next_observation=data_config.include_next_observation,
+        include_future_observation=data_config.include_future_observation,
+        include_goal_observation=data_config.include_goal_observation,
     )
 
 
