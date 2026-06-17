@@ -104,6 +104,13 @@ class DataConfig:
     # Size of the shuffle buffer used by the RLDS loader (in elements, before any HER scaling).
     rlds_shuffle_buffer_size: int = 250_000
 
+    # Which auxiliary HER observations the goal-conditioned data loader should compute and
+    # return. Disabling unused ones reduces memory pressure, since each holds a full
+    # (image) observation.
+    include_next_observation: bool = True
+    include_future_observation: bool = True
+    include_goal_observation: bool = True
+
 
 class GroupFactory(Protocol):
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:

@@ -71,6 +71,12 @@ class DroidRldsDataset:
         # and goal_observation sampled from the same trajectory using a geometric distribution
         # with discount factor her_gamma. Set to None to disable.
         her_gamma: float | None = None,
+        # Which auxiliary HER observations to actually gather and decode. Each disabled
+        # observation removes one full (image) copy per frame -- this reduces gather work,
+        # image decodes, and shuffle-buffer memory. Ignored when her_gamma is None.
+        include_next_observation: bool = True,
+        include_future_observation: bool = True,
+        include_goal_observation: bool = True,
     ):
         # Import tensorflow here to not make it mandatory in case RLDS data loader is not used.
         import dlimp as dl
