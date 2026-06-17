@@ -393,6 +393,10 @@ class RLDSDroidDataConfig(DataConfigFactory):
     # Size of the shuffle buffer used by the RLDS loader (in elements, before any HER scaling).
     # Lower this if the loader runs out of memory on large datasets like the full DROID dataset.
     shuffle_buffer_size: int = 250_000
+    
+    include_future_observation: bool = False
+    include_next_observation: bool = False
+    include_goal_observation: bool = False
 
     # List of datasets to sample from: name, version, weight, and optionally filter_dict_path
     datasets: Sequence[droid_rlds_dataset.RLDSDataset] = (
@@ -453,6 +457,9 @@ class RLDSDroidDataConfig(DataConfigFactory):
             rlds_num_parallel_reads=self.num_parallel_reads,
             rlds_num_parallel_calls=self.num_parallel_calls,
             rlds_shuffle_buffer_size=self.shuffle_buffer_size,
+            include_future_observation=self.include_future_observation,
+            include_next_observation=self.include_next_observation,
+            include_goal_observation=self.include_goal_observation,
         )
 
 
