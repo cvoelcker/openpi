@@ -2,10 +2,11 @@
 #SBATCH -J openpi_train
 #SBATCH -o train.%j.out
 #SBATCH -e train.%j.err
-#SBATCH -N 2                     # Number of nodes
-#SBATCH -n 2                     # One task per node
-#SBATCH --gpus-per-node=8
-#SBATCH -t 48:00:00
+#SBATCH -N 4                     # Number of nodes
+#SBATCH -n 4                     # One task per node
+#SBATCH -t 4:00:00
+#SBATCH -p gh
+#SBATCH -A ASC26008
 
 # Usage:
 #   sbatch scripts/slurm_train.sh <config_name> --exp-name=<name> [extra flags...]
@@ -20,4 +21,11 @@
 
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.9
 
-srun --export=ALL uv run scripts/train.py "$@"
+# srun --export=ALL uv run scripts/train.py "$@"
+# srun --export=ALL uv run scripts/train_rep.py pi05_100_droid_full_finetune_8 --exp-name=my_experiment --overwrite --data.no-filter --fsdp_devices=1 --batch_size=16
+
+srun --export=ALL bash -c '
+  export XLA_PYTHON_CLIENT_MEM_FRACTION=0.9
+  module load tacc-apptainer
+  apptainer exec --nv tensorflow_2502.sif bash ./launch.sh
+  '
