@@ -218,7 +218,14 @@ def train_step(
 
 def main(config: _config.TrainConfig):
     init_logging()
-    logging.info(f"Running on: {platform.node()}")
+
+    jax.distributed.initialize()
+
+    is_main_process = jax.process_index() == 0
+    logging.info(
+        f"Running on: {platform.node()}, process {jax.process_index()}/{jax.process_count()}, "
+        f"{jax.local_device_count()} local / {jax.device_count()} total devices"
+    )
 
     if config.batch_size % jax.device_count() != 0:
         raise ValueError(
@@ -240,7 +247,7 @@ def main(config: _config.TrainConfig):
         overwrite=config.overwrite,
         resume=config.resume,
     )
-    init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
+    init_wandb(config, resuming=resuming, enabled=config.wandb_enabled and is_main_process)
 
     data_loader = _data_loader.create_goal_conditioned_data_loader(
         config,
@@ -278,6 +285,7 @@ def main(config: _config.TrainConfig):
         initial=start_step,
         total=config.num_train_steps,
         dynamic_ncols=True,
+        disable=not is_main_process,
     )
 
     infos = []
@@ -288,9 +296,10 @@ def main(config: _config.TrainConfig):
         if step % config.log_interval == 0:
             stacked_infos = common_utils.stack_forest(infos)
             reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
-            info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
-            pbar.write(f"Step {step}: {info_str}")
-            wandb.log(reduced_info, step=step)
+            if is_main_process:
+                info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
+                pbar.write(f"Step {step}: {info_str}")
+                wandb.log(reduced_info, step=step)
             infos = []
         batch = next(data_iter)
 
