@@ -355,11 +355,8 @@ class Pi0(_model.BaseModel):
 
         crl_matrix = jnp.sum(phi * psi, axis=-1)
         crl_pos = jnp.diag(crl_matrix)
-        crl_neg = jax.nn.logsumexp(
-            crl_matrix, axis=1
-        )  # + jnp.where(off_diag_mask, 0.0, jnp.finfo(crl_matrix.dtype).min), axis=1)
-        crl_reg = jax.nn.logsumexp(crl_matrix, axis=1)
-        crl_loss = jnp.mean(crl_neg - crl_pos + 0.01 * crl_reg)
+        crl_neg = jax.nn.logsumexp(crl_matrix, axis=1)
+        crl_loss = jnp.mean(crl_neg - crl_pos + 0.01 * crl_neg)  # second neg acts as entropy regularization
 
         return action_loss + crl_loss, {"action_loss": action_loss, "rep_loss": crl_loss}
 
