@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import logging
 
 import einops
@@ -101,8 +103,12 @@ class Pi0(_model.BaseModel):
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
 
         # prefix and suffix have differing embedding dimensions, which is going to cause some problem? We might need to project one up or down to match?
-        self.phi_token = nnx.Param(jax.random.uniform(rngs.params(), (1, action_expert_config.width)) / action_expert_config.width)
-        self.psi_token = nnx.Param(jax.random.uniform(rngs.params(), (1, paligemma_config.width)) / paligemma_config.width)
+        self.phi_token = nnx.Param(
+            jax.random.uniform(rngs.params(), (1, action_expert_config.width)) / action_expert_config.width
+        )
+        self.psi_token = nnx.Param(
+            jax.random.uniform(rngs.params(), (1, paligemma_config.width)) / paligemma_config.width
+        )
         # assumes phi is smaller than psi, which is correct for default PI setup
         self.psi_proj = nnx.Linear(paligemma_config.width, action_expert_config.width, rngs=rngs)
 
@@ -138,7 +144,9 @@ class Pi0(_model.BaseModel):
             input_mask.append(obs.tokenized_prompt_mask)
             # full attention between image and language inputs
             ar_mask += [False] * tokenized_inputs.shape[1]
-        tokens.append(jnp.broadcast_to(self.psi_token.value[None], (obs.state.shape[0], 1, self.psi_token.value.shape[-1])))
+        tokens.append(
+            jnp.broadcast_to(self.psi_token.value[None], (obs.state.shape[0], 1, self.psi_token.value.shape[-1]))
+        )
         input_mask.append(jnp.ones((obs.state.shape[0], 1), dtype=jnp.bool_))
         ar_mask += [False]
         tokens = jnp.concatenate(tokens, axis=1)
@@ -187,7 +195,9 @@ class Pi0(_model.BaseModel):
             action_expert_tokens = action_time_tokens
             adarms_cond = None
         tokens.append(action_expert_tokens)
-        tokens.append(jnp.broadcast_to(self.phi_token.value[None], (obs.state.shape[0], 1, self.phi_token.value.shape[-1])))
+        tokens.append(
+            jnp.broadcast_to(self.phi_token.value[None], (obs.state.shape[0], 1, self.phi_token.value.shape[-1]))
+        )
         input_mask.append(jnp.ones(action_expert_tokens.shape[:2], dtype=jnp.bool_))
         input_mask.append(jnp.ones((obs.state.shape[0], 1), dtype=jnp.bool_))
         # image/language/state inputs do not attend to action tokens or phi; phi attends to everything in the suffix
@@ -196,6 +206,102 @@ class Pi0(_model.BaseModel):
         input_mask = jnp.concatenate(input_mask, axis=1)
         ar_mask = jnp.array(ar_mask)
         return tokens, input_mask, ar_mask, adarms_cond
+
+    def _suffix_forward(
+        self,
+        observation: _model.Observation,
+        noisy_actions: _model.Actions,
+        timestep: at.Float[at.Array, "b"],
+        kv_cache,
+        prefix_mask: at.Bool[at.Array, "b s"],
+        prefix_len: int,
+    ):
+        """Shared helper: embed suffix, build masks with psi blocking, run LLM."""
+        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
+            observation, noisy_actions, timestep
+        )
+        suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
+        prefix_attn_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
+        prefix_attn_mask = prefix_attn_mask.at[:, :, prefix_len - 1].set(False)
+        full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
+        positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
+
+        (_, suffix_out), _ = self.PaliGemma.llm(
+            [None, suffix_tokens],
+            mask=full_attn_mask,
+            positions=positions,
+            kv_cache=kv_cache,
+            adarms_cond=[None, adarms_cond],
+        )
+        return suffix_out
+
+    def get_backward_representation(
+        self, observation: _model.Observation
+    ) -> tuple[at.Float[at.Array, "b emb"], "KVCache", at.Bool[at.Array, "b s"], int]:
+        """Compute the action-independent (backward) representation.
+
+        Returns (backward_rep, kv_cache, prefix_mask, prefix_len) where
+        backward_rep is the psi_token output (last prefix token).
+        """
+        observation = _model.preprocess_observation(None, observation, train=False)
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        (prefix_out, _), kv_cache = self.PaliGemma.llm(
+            [prefix_tokens, None], mask=prefix_attn_mask, positions=positions
+        )
+        backward_rep = prefix_out[:, -1]
+        return backward_rep, kv_cache, prefix_mask, prefix_tokens.shape[1]
+
+    def get_forward_representation(
+        self,
+        observation: _model.Observation,
+        noisy_actions: _model.Actions,
+        timestep: at.Float[at.Array, "b"],
+        kv_cache,
+        prefix_mask: at.Bool[at.Array, "b s"],
+        prefix_len: int,
+    ) -> tuple[at.Float[at.Array, "*b emb"], at.Float[at.Array, "*b ah emb"], at.Float[at.Array, "*b ah ad"]]:
+        """Compute the action-dependent (forward) representation and velocity.
+
+        Returns (forward_rep, action_hidden, v_t) where forward_rep is the
+        phi_token output (last suffix token), action_hidden is the transformer
+        hidden states for action tokens, and v_t is the velocity.
+        """
+        suffix_out = self._suffix_forward(observation, noisy_actions, timestep, kv_cache, prefix_mask, prefix_len)
+        forward_rep = suffix_out[:, -1]
+        action_hidden = suffix_out[:, -(self.action_horizon + 1) : -1]
+        v_t = self.action_out_proj(action_hidden)
+        return forward_rep, action_hidden, v_t
+
+    def get_prefix_cache(
+        self, observation: _model.Observation
+    ) -> tuple["KVCache", at.Float[at.Array, "b s emb"], at.Bool[at.Array, "b s"]]:
+        """Compatibility wrapper: returns (kv_cache, prefix_hidden, prefix_mask)."""
+        observation = _model.preprocess_observation(None, observation, train=False)
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        (prefix_out, _), kv_cache = self.PaliGemma.llm(
+            [prefix_tokens, None], mask=prefix_attn_mask, positions=positions
+        )
+        return kv_cache, prefix_out, prefix_mask
+
+    def compute_velocity_step(
+        self,
+        observation: _model.Observation,
+        x_t: _model.Actions,
+        t_pi0: float | at.Float[at.Array, " b"],
+        kv_cache,
+        prefix_mask: at.Bool[at.Array, "b s"],
+    ) -> at.Float[at.Array, "b ah ad"]:
+        """Compatibility wrapper: compute velocity at a single ODE step."""
+        batch_size = x_t.shape[0]
+        timestep = jnp.broadcast_to(jnp.asarray(t_pi0), (batch_size,))
+        prefix_len = prefix_mask.shape[1]
+        suffix_out = self._suffix_forward(observation, x_t, timestep, kv_cache, prefix_mask, prefix_len)
+        action_hidden = suffix_out[:, -(self.action_horizon + 1) : -1]
+        return self.action_out_proj(action_hidden)
 
     def compute_loss(
         self,
@@ -239,7 +345,7 @@ class Pi0(_model.BaseModel):
         )
 
         # Action loss: current-obs half only; future half is masked out.
-        v_t = self.action_out_proj(suffix_out[:orig_batch_size, :self.action_horizon])
+        v_t = self.action_out_proj(suffix_out[:orig_batch_size, : self.action_horizon])
         action_loss = jnp.mean(jnp.square(v_t - u_t[:orig_batch_size]), axis=-1)
 
         # CRL: phi from current suffix, psi from future prefix.
@@ -250,7 +356,9 @@ class Pi0(_model.BaseModel):
         crl_matrix = jnp.sum(phi * psi, axis=-1)
         crl_pos = jnp.diag(crl_matrix)
         off_diag_mask = ~jnp.eye(orig_batch_size, dtype=bool)
-        crl_neg = jax.nn.logsumexp(crl_matrixi, axis=1)  # + jnp.where(off_diag_mask, 0.0, jnp.finfo(crl_matrix.dtype).min), axis=1)
+        crl_neg = jax.nn.logsumexp(
+            crl_matrixi, axis=1
+        )  # + jnp.where(off_diag_mask, 0.0, jnp.finfo(crl_matrix.dtype).min), axis=1)
         crl_reg = jax.nn.logsumexp(crl_matrix, axis=1)
         crl_loss = jnp.mean(crl_neg - crl_pos + 0.01 * crl_reg)
 
@@ -279,39 +387,19 @@ class Pi0(_model.BaseModel):
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
         _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
 
+        prefix_len = prefix_tokens.shape[1]
+
         def step(carry):
             x_t, time = carry
-            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
-                observation, x_t, jnp.broadcast_to(time, batch_size)
+            suffix_out = self._suffix_forward(
+                observation,
+                x_t,
+                jnp.broadcast_to(time, batch_size),
+                kv_cache,
+                prefix_mask,
+                prefix_len,
             )
-            # `suffix_attn_mask` is shape (b, suffix_len, suffix_len) indicating how the suffix tokens can attend to each
-            # other
-            suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
-            # `prefix_attn_mask` is shape (b, suffix_len, prefix_len) indicating how the suffix tokens can attend to the
-            # prefix tokens
-            prefix_attn_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
-            # block suffix tokens from attending to psi_token (last prefix token)
-            prefix_attn_mask = prefix_attn_mask.at[:, :, prefix_tokens.shape[1] - 1].set(False)
-            # `combined_mask` is shape (b, suffix_len, prefix_len + suffix_len) indicating how the suffix tokens (which
-            # generate the queries) can attend to the full prefix + suffix sequence (which generates the keys and values)
-            full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
-            assert full_attn_mask.shape == (
-                batch_size,
-                suffix_tokens.shape[1],
-                prefix_tokens.shape[1] + suffix_tokens.shape[1],
-            )
-            # `positions` is shape (b, suffix_len) indicating the positions of the suffix tokens
-            positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
-
-            (prefix_out, suffix_out), _ = self.PaliGemma.llm(
-                [None, suffix_tokens],
-                mask=full_attn_mask,
-                positions=positions,
-                kv_cache=kv_cache,
-                adarms_cond=[None, adarms_cond],
-            )
-            assert prefix_out is None
-            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+            v_t = self.action_out_proj(suffix_out[:, -(self.action_horizon + 1) : -1])
 
             return x_t + dt * v_t, time + dt
 
