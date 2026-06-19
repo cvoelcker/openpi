@@ -249,10 +249,12 @@ def create_data_loader(
     logging.info(f"data_config: {data_config}")
 
     if data_config.rlds_data_dir is not None:
+        local_batch_size = config.batch_size // jax.process_count()
+        logging.info(f"RLDS local_batch_size: {local_batch_size}")
         return create_rlds_data_loader(
             data_config,
             action_horizon=config.model.action_horizon,
-            batch_size=config.batch_size,
+            batch_size=local_batch_size,
             sharding=sharding,
             shuffle=shuffle,
             num_batches=num_batches,

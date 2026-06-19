@@ -378,9 +378,12 @@ def _create_goal_conditioned_rlds_data_loader(
     """
     from openpi.training.droid_rlds_dataset import DroidRldsDataset
 
+    local_batch_size = config.batch_size // jax.process_count()
+    logger.info(f"RLDS local_batch_size: {local_batch_size}")
+
     rlds_dataset = DroidRldsDataset(
         data_dir=data_config.rlds_data_dir,
-        batch_size=config.batch_size,
+        batch_size=local_batch_size,
         datasets=data_config.datasets,
         shuffle=shuffle,
         action_chunk_size=config.model.action_horizon,
