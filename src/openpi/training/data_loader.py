@@ -308,9 +308,6 @@ def create_torch_data_loader(
     dataset = create_torch_dataset(data_config, action_horizon, model_config)
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
 
-    # Use TorchDataLoader for both frameworks
-    # For PyTorch DDP, create DistributedSampler and divide batch size by world size
-    # For JAX, divide by process count
     sampler = None
     if framework == "pytorch":
         if torch.distributed.is_initialized():
@@ -326,6 +323,14 @@ def create_torch_data_loader(
             local_batch_size = batch_size
     else:
         local_batch_size = batch_size // jax.process_count()
+        if jax.process_count() > 1:
+            sampler = torch.utils.data.distributed.DistributedSampler(
+                dataset,
+                num_replicas=jax.process_count(),
+                rank=jax.process_index(),
+                shuffle=shuffle,
+                drop_last=True,
+            )
 
     logging.info(f"local_batch_size: {local_batch_size}")
     data_loader = TorchDataLoader(
@@ -415,9 +420,6 @@ class TorchDataLoader:
                 execute in the main process.
             seed: The seed to use for shuffling the data.
         """
-        if jax.process_count() > 1:
-            raise NotImplementedError("Data loading with multiple processes is not supported.")
-
         if len(dataset) < local_batch_size:
             raise ValueError(f"Local batch size ({local_batch_size}) is larger than the dataset size ({len(dataset)}).")
 
@@ -504,9 +506,6 @@ class RLDSDataLoader:
     ):
         self._dataset = dataset
         self._num_batches = num_batches
-
-        if jax.process_count() > 1:
-            raise NotImplementedError("Data loading with multiple processes is not supported.")
 
         if sharding is None:
             # Use data parallel sharding by default.
