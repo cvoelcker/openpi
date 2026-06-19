@@ -20,4 +20,4 @@
 
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.9
 
-srun uv run scripts/train.py "$@"
+srun --export=ALL uv run scripts/train.py "$@"
