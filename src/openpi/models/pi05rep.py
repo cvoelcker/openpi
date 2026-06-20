@@ -349,14 +349,21 @@ class Pi0(_model.BaseModel):
         action_loss = jnp.mean(jnp.square(v_t - u_t[:orig_batch_size]), axis=-1)
 
         # CRL: phi from current suffix, psi from future prefix.
-        phi = jnp.expand_dims(suffix_out[:orig_batch_size, -1], axis=0)  # (1, B, emb)
-        psi = jnp.expand_dims(prefix_out[orig_batch_size:, -1], axis=1)  # (B, 1, emb)
+        phi = jnp.expand_dims(suffix_out[:orig_batch_size, -1], axis=0)   # (1, B, emb)
+        psi = jnp.expand_dims(prefix_out[orig_batch_size:, -1], axis=1)   # (B, 1, emb)
         psi = self.psi_proj(psi)
 
-        crl_matrix = jnp.sum(phi * psi, axis=-1)
+        crl_matrix = jnp.sum(phi * psi, axis=-1)   # (B, B): [i, j] = <psi_i, phi_j>
         crl_pos = jnp.diag(crl_matrix)
-        crl_neg = jax.nn.logsumexp(crl_matrix, axis=1)
-        crl_loss = jnp.mean(crl_neg - crl_pos + 0.01 * crl_neg)  # second neg acts as entropy regularization
+
+        # Symmetric InfoNCE: contrast over current states (axis=1) AND over futures (axis=0).
+        crl_neg_fwd = jax.nn.logsumexp(crl_matrix, axis=1)   # anchor psi_i, normalize over phi
+        crl_neg_bwd = jax.nn.logsumexp(crl_matrix, axis=0)   # anchor phi_j, normalize over psi
+        crl_loss = 0.5 * jnp.mean((crl_neg_fwd - crl_pos) + (crl_neg_bwd - crl_pos))
+
+        # Logsumexp penalty (prevents logit blow-up / collapse; JaxGCRL uses coeff 0.1).
+        logsumexp_penalty = 0.5 * (jnp.mean(crl_neg_fwd**2) + jnp.mean(crl_neg_bwd**2))
+        crl_loss = crl_loss + 0.1 * logsumexp_penalty
 
         return action_loss + crl_loss, {"action_loss": action_loss, "rep_loss": crl_loss}
 
