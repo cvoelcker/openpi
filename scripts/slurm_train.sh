@@ -2,9 +2,9 @@
 #SBATCH -J openpi_train
 #SBATCH -o train.%j.out
 #SBATCH -e train.%j.err
-#SBATCH -N 4                     # Number of nodes
-#SBATCH -n 4                     # One task per node
-#SBATCH -t 4:00:00
+#SBATCH -N 8                     # Number of nodes
+#SBATCH -n 8                     # One task per node
+#SBATCH -t 48:00:00
 #SBATCH -p gh
 #SBATCH -A ASC26008
 
