@@ -4,6 +4,13 @@ checkpoints/
 data/
 wandb/
 
+# Slurm job logs.
+train.*.err
+train.*.out
+
+# Don't push uv.lock for now
+uv.lock
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -130,6 +137,7 @@ celerybeat.pid
 # Environments
 .env
 .venv
+.venv-*/
 env/
 venv/
 ENV/

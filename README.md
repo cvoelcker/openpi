@@ -53,8 +53,86 @@ NOTE: `GIT_LFS_SKIP_SMUDGE=1` is needed to pull LeRobot as a dependency.
 
 **Docker**: As an alternative to uv installation, we provide instructions for installing openpi using Docker. If you encounter issues with your system setup, consider using Docker to simplify installation. See [Docker Setup](docs/docker.md) for more details.
 
+### Vista Installation
 
+These instructions are for setting up and training on TACC Vista. They assume you already have `uv` installed and can access Vista's `tacc-apptainer` module.
 
+Run the setup from the repo root. First, load Apptainer and download the NVIDIA TensorFlow SIF container:
+
+```bash
+module load tacc-apptainer
+test -f tensorflow_2502.sif || apptainer pull tensorflow_2502.sif docker://nvcr.io/nvidia/tensorflow:25.02-tf2-py3
+```
+
+Keep the `tacc-apptainer` module loaded for the remaining commands. Then rebuild the repo virtualenv from inside the SIF. This makes `.venv` use the container's Python and CUDA/TensorFlow stack, so the Slurm job does not need host `python`, `cuda`, or `gcc` modules:
+
+```bash
+rm -rf .venv
+apptainer exec --nv --pwd "$PWD" tensorflow_2502.sif bash -lc '
+  set -eo pipefail
+  export PATH="$HOME/.local/bin:$PATH"
+  export UV_CACHE_DIR="${SCRATCH:-$HOME}/.cache/uv"
+
+  uv venv --python /usr/bin/python --system-site-packages .venv
+  source .venv/bin/activate
+
+  UV_LINK_MODE=copy GIT_LFS_SKIP_SMUDGE=1 CC=/usr/bin/gcc CXX=/usr/bin/g++ \
+    uv sync --no-dev --active \
+    --python /usr/bin/python \
+    --no-managed-python \
+    --no-python-downloads \
+    --no-install-package tensorflow
+'
+```
+
+The `--system-site-packages` and `--no-install-package tensorflow` flags are intentional. The SIF provides TensorFlow and the CUDA-facing runtime libraries; installing PyPI TensorFlow into the venv would either fail on the container's Python version or fight the container-provided stack.
+
+You can verify the install without launching a full training run:
+
+```bash
+apptainer exec --nv --pwd "$PWD" tensorflow_2502.sif bash -lc '
+  source .venv/bin/activate
+  python - <<PY
+import platform
+import tensorflow as tf
+import jax
+import jaxlib
+import openpi
+
+print("python", platform.python_version(), platform.machine())
+print("tensorflow", tf.__version__)
+print("jax", jax.__version__, "jaxlib", jaxlib.__version__)
+print("devices", jax.devices())
+print("openpi", openpi.__file__)
+PY
+'
+```
+
+For a one-step training smoke test, run through `srun` so JAX sees the Slurm step environment:
+
+```bash
+# If you are not already on an interactive compute node:
+idev -p gh-dev -N 1 -n 1 -t 02:00:00
+
+srun -N 1 -n 1 --export=ALL apptainer exec --nv --pwd "$PWD" tensorflow_2502.sif bash -lc '
+  source .venv/bin/activate
+  XLA_PYTHON_CLIENT_MEM_FRACTION=0.5 python scripts/train.py debug \
+    --exp-name=vista_smoke \
+    --checkpoint-base-dir="$SCRATCH/openpi_smoke_ckpts" \
+    --overwrite \
+    --num-train-steps=1 \
+    --log-interval=1 \
+    --save-interval=100
+'
+```
+
+To launch the Vista training job, submit the Slurm wrapper from a login node:
+
+```bash
+sbatch scripts/slurm_train.sh
+```
+
+The wrapper loads only `tacc-apptainer` and runs `bash ./launch.sh` inside `tensorflow_2502.sif`. For DROID RLDS training configs such as `pi05_crl_droid_finetune`, the default config expects the dataset parent directory at `$SCRATCH/.cache/droid/`, with the dataset itself under `$SCRATCH/.cache/droid/droid/1.0.1`.
 
 ## Model Checkpoints
 
