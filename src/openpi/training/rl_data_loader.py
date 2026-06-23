@@ -101,12 +101,18 @@ class RandomFutureDataset(_data_loader.Dataset):
         *,
         sampling: GoalSamplingConfig,
         action_chunk_size: int = 1,
+        include_next_observation: bool = True,
+        include_future_observation: bool = True,
+        include_goal_observation: bool = True,
     ):
         self._dataset = transformed_dataset
         self._ep_start = ep_start
         self._ep_end = ep_end
         self._sampling = sampling
         self._action_chunk_size = action_chunk_size
+        self._include_next = include_next_observation
+        self._include_future = include_future_observation
+        self._include_goal = include_goal_observation
         self._gen: np.random.Generator | None = None
 
     def __len__(self) -> int:
@@ -170,16 +176,18 @@ class RandomFutureDataset(_data_loader.Dataset):
         actions = anchor.get("actions")
 
         def _obs_only(sample: dict) -> dict:
-            # Drop the action chunk from the auxiliary frames -- only the observation is needed.
             return {k: v for k, v in sample.items() if k != "actions"}
 
-        item = {
-            "observation": _obs_only(anchor),
-            "next_observation": _obs_only(self._dataset[next_idx]),
-            "future_observation": _obs_only(self._dataset[future_idx]),
-            "goal_observation": _obs_only(self._dataset[goal_idx]),
-            **pads,
-        }
+        item = {"observation": _obs_only(anchor)}
+        if self._include_next:
+            item["next_observation"] = _obs_only(self._dataset[next_idx])
+            item["next_is_pad"] = pads["next_is_pad"]
+        if self._include_future:
+            item["future_observation"] = _obs_only(self._dataset[future_idx])
+            item["future_is_pad"] = pads["future_is_pad"]
+        if self._include_goal:
+            item["goal_observation"] = _obs_only(self._dataset[goal_idx])
+            item["goal_is_pad"] = pads["goal_is_pad"]
         if actions is not None:
             item["actions"] = actions
         return item
@@ -197,15 +205,13 @@ class GoalConditionedDataLoader(_data_loader.DataLoader):
 
     def __iter__(self) -> Iterator[dict]:
         for batch in self._data_loader:
-            out = {
-                "observation": _model.Observation.from_dict(batch["observation"]),
-                "next_observation": _model.Observation.from_dict(batch["next_observation"]),
-                "future_observation": _model.Observation.from_dict(batch["future_observation"]),
-                "goal_observation": _model.Observation.from_dict(batch["goal_observation"]),
-                "next_is_pad": batch["next_is_pad"],
-                "future_is_pad": batch["future_is_pad"],
-                "goal_is_pad": batch["goal_is_pad"],
-            }
+            out = {"observation": _model.Observation.from_dict(batch["observation"])}
+            for key in ("next_observation", "future_observation", "goal_observation"):
+                if key in batch:
+                    out[key] = _model.Observation.from_dict(batch[key])
+            for key in ("next_is_pad", "future_is_pad", "goal_is_pad"):
+                if key in batch:
+                    out[key] = batch[key]
             if "actions" in batch:
                 out["actions"] = batch["actions"]
             yield out
@@ -255,15 +261,13 @@ class IterableHERTransformedDataset(_data_loader.IterableDataset):
         def _transform_aux(obs_dict) -> dict:
             return self._aux_transform_fn(_build_obs_input(obs_dict, include_actions=False))
 
-        result = {
-            "observation": anchor_out,
-            "next_observation": _transform_aux(sample["next_observation"]),
-            "future_observation": _transform_aux(sample["future_observation"]),
-            "goal_observation": _transform_aux(sample["goal_observation"]),
-            "next_is_pad": sample["next_is_pad"],
-            "future_is_pad": sample["future_is_pad"],
-            "goal_is_pad": sample["goal_is_pad"],
-        }
+        result = {"observation": anchor_out}
+        for key in ("next_observation", "future_observation", "goal_observation"):
+            if key in sample:
+                result[key] = _transform_aux(sample[key])
+        for key in ("next_is_pad", "future_is_pad", "goal_is_pad"):
+            if key in sample:
+                result[key] = sample[key]
         if actions is not None:
             result["actions"] = actions
         return result
@@ -342,7 +346,16 @@ def create_goal_conditioned_data_loader(
     transformed = _data_loader.transform_dataset(base_dataset, data_config, skip_norm_stats=skip_norm_stats)
 
     ep_start, ep_end = _per_frame_episode_bounds(raw_dataset)
-    dataset = RandomFutureDataset(transformed, ep_start, ep_end, sampling=sampling, action_chunk_size=action_horizon)
+    dataset = RandomFutureDataset(
+        transformed,
+        ep_start,
+        ep_end,
+        sampling=sampling,
+        action_chunk_size=action_horizon,
+        include_next_observation=data_config.include_next_observation,
+        include_future_observation=data_config.include_future_observation,
+        include_goal_observation=data_config.include_goal_observation,
+    )
 
     local_batch_size = config.batch_size // jax.process_count()
     logger.info(f"local_batch_size: {local_batch_size}")
@@ -392,6 +405,9 @@ def _create_goal_conditioned_rlds_data_loader(
         num_parallel_reads=data_config.rlds_num_parallel_reads,
         num_parallel_calls=data_config.rlds_num_parallel_calls,
         shuffle_buffer_size=data_config.rlds_shuffle_buffer_size,
+        include_next_observation=data_config.include_next_observation,
+        include_future_observation=data_config.include_future_observation,
+        include_goal_observation=data_config.include_goal_observation,
     )
 
     norm_stats: dict = {}

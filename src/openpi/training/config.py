@@ -101,7 +101,7 @@ class DataConfig:
     rlds_num_parallel_reads: int = -1
     # Number of map calls run in parallel by the RLDS loader. -1 == tf.data.AUTOTUNE.
     rlds_num_parallel_calls: int = -1
-    # Size of the shuffle buffer used by the RLDS loader (in elements, before any HER scaling).
+    # Size of the shuffle buffer used by the RLDS loader (in elements).
     rlds_shuffle_buffer_size: int = 250_000
 
     # Which auxiliary HER observations the goal-conditioned data loader should compute and
@@ -390,7 +390,7 @@ class RLDSDroidDataConfig(DataConfigFactory):
     num_parallel_reads: int = -1
     # Number of map calls run in parallel by the RLDS loader. -1 == tf.data.AUTOTUNE.
     num_parallel_calls: int = -1
-    # Size of the shuffle buffer used by the RLDS loader (in elements, before any HER scaling).
+    # Size of the shuffle buffer used by the RLDS loader (in elements).
     # Lower this if the loader runs out of memory on large datasets like the full DROID dataset.
     shuffle_buffer_size: int = 250_000
     

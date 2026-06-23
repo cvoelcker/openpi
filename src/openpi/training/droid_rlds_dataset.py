@@ -295,12 +295,15 @@ class DroidRldsDataset:
                     def gather_obs(obs, idx):
                         return tf.nest.map_structure(lambda x: tf.gather(x, idx), obs)
 
-                    traj["next_observation"] = gather_obs(traj["observation"], next_indices)
-                    traj["future_observation"] = gather_obs(traj["observation"], future_indices)
-                    traj["goal_observation"] = gather_obs(traj["observation"], goal_indices)
-                    traj["next_is_pad"] = next_is_pad
-                    traj["future_is_pad"] = tf.logical_not(has_future)
-                    traj["goal_is_pad"] = tf.logical_not(has_future)
+                    if include_next_observation:
+                        traj["next_observation"] = gather_obs(traj["observation"], next_indices)
+                        traj["next_is_pad"] = next_is_pad
+                    if include_future_observation:
+                        traj["future_observation"] = gather_obs(traj["observation"], future_indices)
+                        traj["future_is_pad"] = tf.logical_not(has_future)
+                    if include_goal_observation:
+                        traj["goal_observation"] = gather_obs(traj["observation"], goal_indices)
+                        traj["goal_is_pad"] = tf.logical_not(has_future)
                     return traj
 
                 dataset = dataset.traj_map(add_her_samples, num_parallel_calls)
@@ -361,11 +364,13 @@ class DroidRldsDataset:
 
                 if her_gamma is not None:
                     try:
-                        frame["next_observation"] = decode_obs(frame["next_observation"])
-                        frame["future_observation"] = decode_obs(frame["future_observation"])
-                        frame["goal_observation"] = decode_obs(frame["goal_observation"])
+                        if include_next_observation:
+                            frame["next_observation"] = decode_obs(frame["next_observation"])
+                        if include_future_observation:
+                            frame["future_observation"] = decode_obs(frame["future_observation"])
+                        if include_goal_observation:
+                            frame["goal_observation"] = decode_obs(frame["goal_observation"])
                     except Exception:
-                        # ignore failures in the fallback path
                         pass
                 return frame
 
@@ -383,10 +388,7 @@ class DroidRldsDataset:
 
         with log_stage("finalize_dataset"):
             final_dataset = dl.DLataset.sample_from_datasets(all_datasets, weights=weights)
-            # With HER, each frame holds 4× the decoded image data (one copy per obs).
-            # Scale the buffer down proportionally so it uses the same peak RAM as without HER.
-            effective_buffer = shuffle_buffer_size // 4 if her_gamma is not None else shuffle_buffer_size
-            final_dataset = final_dataset.shuffle(effective_buffer)
+            final_dataset = final_dataset.shuffle(shuffle_buffer_size)
             final_dataset = final_dataset.batch(batch_size)
             # Note =>> Seems to reduce memory usage without affecting speed?
             # final_dataset = final_dataset.with_ram_budget(1)
