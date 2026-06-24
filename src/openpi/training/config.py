@@ -6,6 +6,8 @@ import dataclasses
 import difflib
 import logging
 import pathlib
+import uuid
+from datetime import datetime
 from typing import Any, Literal, Protocol, TypeAlias
 
 import etils.epath as epath
@@ -562,6 +564,11 @@ class TrainConfig:
     # If true, will resume training from the last checkpoint.
     resume: bool = False
 
+    # If true, appends a unique run ID (timestamp + short UUID) to the checkpoint directory
+    # to avoid collisions when running multiple experiments in parallel.
+    unique_run_id: bool = False
+    _run_id_suffix: tyro.conf.Suppress[str] = ""
+
     # If true, will enable wandb logging.
     wandb_enabled: bool = True
 
@@ -584,7 +591,8 @@ class TrainConfig:
         """Get the checkpoint directory for this config."""
         if not self.exp_name:
             raise ValueError("--exp_name must be set")
-        return (pathlib.Path(self.checkpoint_base_dir) / self.name / self.exp_name).resolve()
+        exp = self.exp_name + self._run_id_suffix
+        return (pathlib.Path(self.checkpoint_base_dir) / self.name / exp).resolve()
 
     @property
     def trainable_filter(self) -> nnx.filterlib.Filter:
@@ -594,6 +602,10 @@ class TrainConfig:
     def __post_init__(self) -> None:
         if self.resume and self.overwrite:
             raise ValueError("Cannot resume and overwrite at the same time.")
+        if self.unique_run_id and not self._run_id_suffix:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            short_id = uuid.uuid4().hex[:6]
+            object.__setattr__(self, "_run_id_suffix", f"_{timestamp}_{short_id}")
 
 
 # Use `get_config` if you need to get a config by name in your code.
