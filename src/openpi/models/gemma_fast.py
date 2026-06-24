@@ -32,7 +32,7 @@ import openpi.shared.array_typing as at
 Variant = Literal["gemma_2b", "gemma_2b_lora"]
 
 
-def get_config(variant):
+def get_config(variant, lora_rank=None, lora_alpha=None):
     """Returns config for specified gemma variant."""
     if variant == "gemma_2b":
         return ml_collections.ConfigDict(
@@ -51,6 +51,8 @@ def get_config(variant):
             }
         )
     if variant == "gemma_2b_lora":
+        rank = lora_rank if lora_rank is not None else 16
+        alpha = lora_alpha if lora_alpha is not None else float(rank)
         return ml_collections.ConfigDict(
             {
                 "variant": variant,
@@ -65,8 +67,8 @@ def get_config(variant):
                 "scan": True,
                 "remat_policy": "nothing_saveable",
                 "lora_configs": {
-                    "attn": lora.LoRAConfig(rank=16, alpha=16.0),
-                    "ffn": lora.LoRAConfig(rank=16, alpha=16.0),
+                    "attn": lora.LoRAConfig(rank=rank, alpha=alpha),
+                    "ffn": lora.LoRAConfig(rank=rank, alpha=alpha),
                 },
             }
         )

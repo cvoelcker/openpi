@@ -22,6 +22,11 @@ class Pi0Config(_model.BaseModelConfig):
     paligemma_variant: _gemma.Variant = "gemma_2b"
     action_expert_variant: _gemma.Variant = "gemma_300m"
 
+    paligemma_lora_rank: int | None = None
+    paligemma_lora_alpha: float | None = None
+    action_expert_lora_rank: int | None = None
+    action_expert_lora_alpha: float | None = None
+
     # Set the model specific defaults.
     action_dim: int = 32
     action_horizon: int = 50

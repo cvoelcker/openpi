@@ -55,7 +55,11 @@ class Config:
 Variant = Literal["dummy", "gemma_300m", "gemma_300m_lora", "gemma_2b", "gemma_2b_lora"]
 
 
-def get_config(variant: Variant) -> Config:
+def get_config(
+    variant: Variant,
+    lora_rank: int | None = None,
+    lora_alpha: float | None = None,
+) -> Config:
     """Returns config for specified gemma variant."""
     if variant == "dummy":
         return Config(
@@ -86,6 +90,8 @@ def get_config(variant: Variant) -> Config:
             head_dim=256,
         )
     if variant == "gemma_2b_lora":
+        rank = lora_rank if lora_rank is not None else 16
+        alpha = lora_alpha if lora_alpha is not None else float(rank)
         return Config(
             width=2048,
             depth=18,
@@ -93,9 +99,11 @@ def get_config(variant: Variant) -> Config:
             num_heads=8,
             num_kv_heads=1,
             head_dim=256,
-            lora_configs={"attn": lora.LoRAConfig(rank=16, alpha=16.0), "ffn": lora.LoRAConfig(rank=16, alpha=16.0)},
+            lora_configs={"attn": lora.LoRAConfig(rank=rank, alpha=alpha), "ffn": lora.LoRAConfig(rank=rank, alpha=alpha)},
         )
     if variant == "gemma_300m_lora":
+        rank = lora_rank if lora_rank is not None else 32
+        alpha = lora_alpha if lora_alpha is not None else float(rank)
         # 311M params
         return Config(
             width=1024,
@@ -104,7 +112,7 @@ def get_config(variant: Variant) -> Config:
             num_heads=8,
             num_kv_heads=1,
             head_dim=256,
-            lora_configs={"attn": lora.LoRAConfig(rank=32, alpha=32.0), "ffn": lora.LoRAConfig(rank=32, alpha=32.0)},
+            lora_configs={"attn": lora.LoRAConfig(rank=rank, alpha=alpha), "ffn": lora.LoRAConfig(rank=rank, alpha=alpha)},
         )
     raise ValueError(f"Unknown variant: {variant}")
 
