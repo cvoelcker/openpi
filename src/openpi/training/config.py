@@ -394,9 +394,9 @@ class RLDSDroidDataConfig(DataConfigFactory):
     # Lower this if the loader runs out of memory on large datasets like the full DROID dataset.
     shuffle_buffer_size: int = 250_000
     
-    include_future_observation: bool = False
-    include_next_observation: bool = False
-    include_goal_observation: bool = False
+    include_future_observation: bool = True
+    include_next_observation: bool = True
+    include_goal_observation: bool = True
 
     # List of datasets to sample from: name, version, weight, and optionally filter_dict_path
     datasets: Sequence[droid_rlds_dataset.RLDSDataset] = (
