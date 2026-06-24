@@ -8,6 +8,7 @@ from typing import Protocol
 
 from etils import epath
 import jax
+from jax.experimental import multihost_utils
 import orbax.checkpoint as ocp
 import orbax.checkpoint.future as future
 
@@ -22,12 +23,13 @@ def initialize_checkpoint_dir(
 ) -> tuple[ocp.CheckpointManager, bool]:
     checkpoint_dir = epath.Path(checkpoint_dir).resolve()
     resuming = False
-    if checkpoint_dir.exists():
-        if overwrite:
+    if overwrite:
+        if jax.process_index() == 0 and checkpoint_dir.exists():
             checkpoint_dir.rmtree()
-            checkpoint_dir.mkdir(parents=True, exist_ok=True)
             logging.info(f"Wiped checkpoint directory {checkpoint_dir}")
-        elif resume:
+        _sync_hosts("openpi_checkpoint_dir_overwrite")
+    elif checkpoint_dir.exists():
+        if resume:
             resuming = True
         else:
             raise FileExistsError(
@@ -36,6 +38,7 @@ def initialize_checkpoint_dir(
             )
 
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    _sync_hosts("openpi_checkpoint_dir_ready")
 
     mngr = ocp.CheckpointManager(
         checkpoint_dir,
@@ -60,6 +63,11 @@ def initialize_checkpoint_dir(
         resuming = False
 
     return mngr, resuming
+
+
+def _sync_hosts(name: str) -> None:
+    if jax.process_count() > 1:
+        multihost_utils.sync_global_devices(name)
 
 
 def save_state(

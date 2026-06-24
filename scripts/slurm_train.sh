@@ -6,7 +6,7 @@
 #SBATCH -n 1                     # One task per node
 #SBATCH -t 48:00:00
 #SBATCH -p gh
-#SBATCH -A ASC26008
+#SBATCH -A ASC24079              # Formerly: ASC26008
 
 # Usage:
 #   sbatch scripts/slurm_train.sh <config_name> --exp-name=<name> [extra flags...]

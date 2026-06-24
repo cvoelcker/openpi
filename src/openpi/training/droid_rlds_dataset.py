@@ -388,7 +388,15 @@ class DroidRldsDataset:
 
         with log_stage("finalize_dataset"):
             final_dataset = dl.DLataset.sample_from_datasets(all_datasets, weights=weights)
-            final_dataset = final_dataset.shuffle(shuffle_buffer_size)
+            # Let shuffle_buffer_size account for the true number of observation copies used.
+            num_obs_copies = (
+                1
+                + int(include_next_observation)
+                + int(include_future_observation)
+                + int(include_goal_observation)
+            )
+            effective_buffer = shuffle_buffer_size // num_obs_copies if her_gamma is not None else shuffle_buffer_size
+            final_dataset = final_dataset.shuffle(effective_buffer)
             final_dataset = final_dataset.batch(batch_size)
             # Note =>> Seems to reduce memory usage without affecting speed?
             # final_dataset = final_dataset.with_ram_budget(1)

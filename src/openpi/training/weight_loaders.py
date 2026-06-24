@@ -4,6 +4,8 @@ import re
 from typing import Protocol, runtime_checkable
 
 import flax.traverse_util
+import jax
+from jax.experimental import multihost_utils
 import numpy as np
 
 import openpi.models.model as _model
@@ -49,7 +51,7 @@ class CheckpointWeightLoader(WeightLoader):
 
     def load(self, params: at.Params) -> at.Params:
         # We are loading np.ndarray and relying on the training code to properly convert and shard the params.
-        loaded_params = _model.restore_params(download.maybe_download(self.params_path), restore_type=np.ndarray)
+        loaded_params = _model.restore_params(_maybe_download_on_primary(self.params_path), restore_type=np.ndarray)
         # Add all missing LoRA weights.
         return _merge_params(loaded_params, params, missing_regex=".*lora.*")
 
@@ -63,7 +65,7 @@ class PaliGemmaWeightLoader(WeightLoader):
     """
 
     def load(self, params: at.Params) -> at.Params:
-        path = download.maybe_download(
+        path = _maybe_download_on_primary(
             "gs://vertex-model-garden-paligemma-us/paligemma/pt_224.npz", gs={"token": "anon"}
         )
         with path.open("rb") as f:
@@ -71,6 +73,19 @@ class PaliGemmaWeightLoader(WeightLoader):
         loaded_params = {"PaliGemma": flax.traverse_util.unflatten_dict(flat_params, sep="/")["params"]}
         # Add all missing weights.
         return _merge_params(loaded_params, params, missing_regex=".*")
+
+
+def _maybe_download_on_primary(path: str, **kwargs):
+    if jax.process_count() == 1:
+        return download.maybe_download(path, **kwargs)
+
+    if jax.process_index() == 0:
+        local_path = download.maybe_download(path, **kwargs)
+        multihost_utils.sync_global_devices(f"openpi_weight_loader:{path}")
+        return local_path
+
+    multihost_utils.sync_global_devices(f"openpi_weight_loader:{path}")
+    return download.maybe_download(path, **kwargs)
 
 
 def _merge_params(loaded_params: at.Params, params: at.Params, *, missing_regex: str) -> at.Params:

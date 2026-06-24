@@ -1,2 +1,18 @@
 source .venv/bin/activate
-XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 python scripts/train_rep.py pi05_crl_droid_finetune --exp-name=my_experiment --overwrite --data.no-include-next-observation --data.no-include-goal-observation --data.num-parallel-reads=-1 --data.num-parallel-calls=-1 --data.no-filter --data.shuffle-buffer-size=50000 --batch-size=16
+
+args=(
+  pi05_crl_droid_finetune
+  --exp-name=crl_rep_train              # checkpoint/W&B run name
+  --overwrite                           # replace existing checkpoint dir
+  --data.no-include-next-observation    # skip unused HER next obs
+  --data.no-include-goal-observation    # skip unused HER goal obs
+  --data.num-parallel-reads=8           # 8 is the verified max on 1 node so far
+  --data.num-parallel-calls=8           # 8 is the verified max on 1 node so far
+  --data.no-filter                      # disable DROID filter ranges
+  --data.shuffle-buffer-size=50000      # 50000 won't OOM on 1 node
+  --batch-size=16
+  --save-interval=999999                # skip periodic save (will save at last train step)
+  --num-train-steps=6000
+)
+
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 python scripts/train_rep.py "${args[@]}"
