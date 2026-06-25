@@ -395,7 +395,7 @@ class RLDSDroidDataConfig(DataConfigFactory):
     # Size of the shuffle buffer used by the RLDS loader (in elements).
     # Lower this if the loader runs out of memory on large datasets like the full DROID dataset.
     shuffle_buffer_size: int = 250_000
-    
+
     include_future_observation: bool = True
     include_next_observation: bool = True
     include_goal_observation: bool = True
@@ -551,6 +551,13 @@ class TrainConfig:
     num_workers: int = 2
     # Number of train steps (batches) to run.
     num_train_steps: int = 30_000
+
+    # Fraction of episodes to hold out for validation (0.0 = no validation).
+    val_fraction: float = 0.0
+    # How often (in steps) to compute validation loss. Only used when val_fraction > 0.
+    val_interval: int = 1000
+    # Number of batches to average over when computing validation loss.
+    val_batches: int = 10
 
     # How often (in steps) to log training metrics.
     log_interval: int = 100

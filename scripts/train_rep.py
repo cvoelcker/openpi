@@ -2,6 +2,7 @@ import dataclasses
 import functools
 import logging
 import platform
+import time
 from typing import Any
 
 import etils.epath as epath
@@ -216,6 +217,28 @@ def train_step(
     return new_state, info
 
 
+@at.typecheck
+def val_step(
+    state: training_utils.TrainState,
+    rng: at.KeyArrayLike,
+    batch: GoalConditionedBatch,
+) -> dict[str, at.Array]:
+    params = state.ema_params if state.ema_params is not None else state.params
+    model = nnx.merge(state.model_def, params)
+    model.eval()
+
+    observation = batch["observation"]
+    future_observation = batch["future_observation"]
+    actions = batch["actions"]
+
+    chunked_loss, log_dict = model.compute_loss(rng, observation, future_observation, actions, train=False)
+    return {
+        "val/loss": jnp.mean(chunked_loss),
+        "val/action_loss": log_dict["action_loss"],
+        "val/rep_loss": log_dict["rep_loss"],
+    }
+
+
 def main(config: _config.TrainConfig):
     init_logging()
 
@@ -249,13 +272,17 @@ def main(config: _config.TrainConfig):
     )
     init_wandb(config, resuming=resuming, enabled=config.wandb_enabled and is_main_process)
 
-    data_loader = _data_loader.create_goal_conditioned_data_loader(
+    train_loader, val_loader = _data_loader.create_train_val_goal_conditioned_data_loaders(
         config,
         sharding=data_sharding,
-        shuffle=True,
     )
-    data_iter = iter(data_loader)
+    data_iter = iter(train_loader)
+    val_iter = iter(val_loader) if val_loader is not None else None
+    logging.info("About to fetch first batch from data loader...")
+    t0 = time.time()
     batch = next(data_iter)
+    t1 = time.time()
+    logging.info("Fetched first batch in %.3f s", t1 - t0)
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
 
     # # Log images from first batch to sanity check.
@@ -270,7 +297,7 @@ def main(config: _config.TrainConfig):
     logging.info(f"Initialized train state:\n{training_utils.array_tree_to_info(train_state.params)}")
 
     if resuming:
-        train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
+        train_state = _checkpoints.restore_state(checkpoint_manager, train_state, train_loader)
 
     ptrain_step = jax.jit(
         functools.partial(train_step, config),
@@ -278,6 +305,12 @@ def main(config: _config.TrainConfig):
         out_shardings=(train_state_sharding, replicated_sharding),
         donate_argnums=(1,),
     )
+
+    pval_step = jax.jit(
+        val_step,
+        in_shardings=(train_state_sharding, replicated_sharding, data_sharding),
+        out_shardings=replicated_sharding,
+    ) if val_loader is not None else None
 
     start_step = int(train_state.step)
     pbar = tqdm.tqdm(
@@ -303,8 +336,23 @@ def main(config: _config.TrainConfig):
             infos = []
         batch = next(data_iter)
 
+        if pval_step is not None and val_iter is not None and step % config.val_interval == 0:
+            val_rng = jax.random.fold_in(train_rng, step)
+            val_infos = []
+            for _ in range(config.val_batches):
+                val_batch = next(val_iter)
+                with sharding.set_mesh(mesh):
+                    vi = pval_step(train_state, val_rng, val_batch)
+                val_infos.append(vi)
+            stacked_val = common_utils.stack_forest(val_infos)
+            reduced_val = jax.device_get(jax.tree.map(jnp.mean, stacked_val))
+            if is_main_process:
+                val_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_val.items())
+                pbar.write(f"Step {step} [val]: {val_str}")
+                wandb.log(reduced_val, step=step)
+
         if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
-            _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
+            _checkpoints.save_state(checkpoint_manager, train_state, train_loader, step)
 
     logging.info("Waiting for checkpoint manager to finish")
     checkpoint_manager.wait_until_finished()

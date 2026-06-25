@@ -373,6 +373,81 @@ def create_goal_conditioned_data_loader(
     return GoalConditionedDataLoader(data_config, torch_loader)
 
 
+def create_train_val_goal_conditioned_data_loaders(
+    config: _config.TrainConfig,
+    *,
+    sampling: GoalSamplingConfig | None = None,
+    sharding: jax.sharding.Sharding | None = None,
+) -> tuple[GoalConditionedDataLoader, GoalConditionedDataLoader | None]:
+    """Create train and (optionally) val goal-conditioned data loaders with episode-level splitting.
+
+    Returns (train_loader, val_loader). val_loader is None when config.val_fraction == 0.
+    """
+    if config.val_fraction <= 0:
+        train_loader = create_goal_conditioned_data_loader(config, sampling=sampling, sharding=sharding, shuffle=True)
+        return train_loader, None
+
+    sampling = sampling or GoalSamplingConfig(seed=config.seed)
+    data_config = config.data.create(config.assets_dirs, config.model)
+
+    if data_config.rlds_data_dir is not None:
+        val_pct = int(config.val_fraction * 100)
+        train_loader = _create_goal_conditioned_rlds_data_loader(
+            config, data_config, sampling=sampling, sharding=sharding, shuffle=True,
+            num_batches=None, skip_norm_stats=False, tfds_split=f"train[:{100 - val_pct}%]",
+        )
+        val_loader = _create_goal_conditioned_rlds_data_loader(
+            config, data_config, sampling=sampling, sharding=sharding, shuffle=False,
+            num_batches=None, skip_norm_stats=False, tfds_split=f"train[{100 - val_pct}%:]",
+        )
+        return train_loader, val_loader
+
+    # LeRobot path: split by episode indices.
+    if data_config.repo_id is None or data_config.repo_id == "fake":
+        raise ValueError("Val split requires a real dataset.")
+
+    action_horizon = config.model.action_horizon
+    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(data_config.repo_id)
+    raw_dataset = lerobot_dataset.LeRobotDataset(
+        data_config.repo_id,
+        delta_timestamps={
+            key: [t / dataset_meta.fps for t in range(action_horizon)]
+            for key in data_config.action_sequence_keys
+        },
+    )
+
+    base_dataset: _data_loader.Dataset = raw_dataset
+    if data_config.prompt_from_task:
+        base_dataset = _data_loader.TransformedDataset(
+            raw_dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)]
+        )
+
+    transformed = _data_loader.transform_dataset(base_dataset, data_config)
+
+    ep_start, ep_end = _per_frame_episode_bounds(raw_dataset)
+    train_indices, val_indices = _data_loader._split_episode_indices(raw_dataset, config.val_fraction, config.seed)
+
+    def _make_loader(indices, shuffle):
+        dataset = RandomFutureDataset(
+            transformed, ep_start, ep_end,
+            sampling=sampling, action_chunk_size=action_horizon,
+            include_next_observation=data_config.include_next_observation,
+            include_future_observation=data_config.include_future_observation,
+            include_goal_observation=data_config.include_goal_observation,
+        )
+        local_batch_size = config.batch_size // jax.process_count()
+        sampler = torch.utils.data.SubsetRandomSampler(indices.tolist())
+        torch_loader = _data_loader.TorchDataLoader(
+            dataset, local_batch_size=local_batch_size,
+            sharding=sharding, sampler=sampler,
+            num_workers=config.num_workers if shuffle else 0,
+            seed=config.seed,
+        )
+        return GoalConditionedDataLoader(data_config, torch_loader)
+
+    return _make_loader(train_indices, True), _make_loader(val_indices, False)
+
+
 def _create_goal_conditioned_rlds_data_loader(
     config: _config.TrainConfig,
     data_config: _config.DataConfig,
@@ -382,6 +457,7 @@ def _create_goal_conditioned_rlds_data_loader(
     shuffle: bool,
     num_batches: int | None,
     skip_norm_stats: bool,
+    tfds_split: str = "train",
 ) -> GoalConditionedDataLoader:
     """RLDS/DROID path for goal-conditioned data loading.
 
@@ -404,6 +480,7 @@ def _create_goal_conditioned_rlds_data_loader(
         her_gamma=sampling.gamma,
         num_parallel_reads=data_config.rlds_num_parallel_reads,
         num_parallel_calls=data_config.rlds_num_parallel_calls,
+        tfds_split=tfds_split,
         shuffle_buffer_size=data_config.rlds_shuffle_buffer_size,
         include_next_observation=data_config.include_next_observation,
         include_future_observation=data_config.include_future_observation,

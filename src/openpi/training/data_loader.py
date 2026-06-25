@@ -127,6 +127,36 @@ class FakeDataset(Dataset):
         return self._num_samples
 
 
+def _split_episode_indices(
+    dataset, val_fraction: float, seed: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """Split a LeRobot dataset into train/val frame indices by episode.
+
+    Returns (train_indices, val_indices) as int64 arrays.
+    """
+    ep_from = np.asarray(dataset.episode_data_index["from"]).astype(np.int64)
+    ep_to = np.asarray(dataset.episode_data_index["to"]).astype(np.int64)
+    num_episodes = len(ep_from)
+
+    rng = np.random.RandomState(seed)
+    perm = rng.permutation(num_episodes)
+    num_val = max(1, int(num_episodes * val_fraction))
+    val_eps = set(perm[:num_val].tolist())
+
+    train_indices = np.concatenate(
+        [np.arange(ep_from[i], ep_to[i]) for i in range(num_episodes) if i not in val_eps]
+    )
+    val_indices = np.concatenate(
+        [np.arange(ep_from[i], ep_to[i]) for i in range(num_episodes) if i in val_eps]
+    )
+
+    logging.info(
+        f"Episode split: {num_episodes - num_val} train / {num_val} val episodes, "
+        f"{len(train_indices)} train / {len(val_indices)} val frames"
+    )
+    return train_indices, val_indices
+
+
 def create_torch_dataset(
     data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
 ) -> Dataset:
@@ -157,6 +187,7 @@ def create_rlds_dataset(
     batch_size: int,
     *,
     shuffle: bool = False,
+    tfds_split: str = "train",
 ) -> Dataset:
     # At the moment, we only support DROID for RLDS datasets.
     return DroidRldsDataset(
@@ -172,6 +203,7 @@ def create_rlds_dataset(
         include_next_observation=data_config.include_next_observation,
         include_future_observation=data_config.include_future_observation,
         include_goal_observation=data_config.include_goal_observation,
+        tfds_split=tfds_split,
     )
 
 
@@ -276,6 +308,80 @@ def create_data_loader(
     )
 
 
+def create_train_val_data_loaders(
+    config: _config.TrainConfig,
+    *,
+    sharding: jax.sharding.Sharding | None = None,
+    framework: Literal["jax", "pytorch"] = "jax",
+) -> tuple[DataLoader[tuple[_model.Observation, _model.Actions]], DataLoader[tuple[_model.Observation, _model.Actions]] | None]:
+    """Create train and (optionally) val data loaders with episode-level splitting.
+
+    Returns (train_loader, val_loader). val_loader is None when config.val_fraction == 0.
+    """
+    if config.val_fraction <= 0:
+        train_loader = create_data_loader(config, sharding=sharding, shuffle=True, framework=framework)
+        return train_loader, None
+
+    data_config = config.data.create(config.assets_dirs, config.model)
+
+    if data_config.rlds_data_dir is not None:
+        local_batch_size = config.batch_size // jax.process_count()
+        val_pct = int(config.val_fraction * 100)
+        train_loader = create_rlds_data_loader(
+            data_config,
+            action_horizon=config.model.action_horizon,
+            batch_size=local_batch_size,
+            sharding=sharding,
+            shuffle=True,
+            framework=framework,
+            tfds_split=f"train[:{100 - val_pct}%]",
+        )
+        val_loader = create_rlds_data_loader(
+            data_config,
+            action_horizon=config.model.action_horizon,
+            batch_size=local_batch_size,
+            sharding=sharding,
+            shuffle=False,
+            framework=framework,
+            tfds_split=f"train[{100 - val_pct}%:]",
+        )
+        return train_loader, val_loader
+
+    # LeRobot path: split by episode indices.
+    dataset = create_torch_dataset(data_config, config.model.action_horizon, config.model)
+    base_dataset = dataset
+    while isinstance(base_dataset, TransformedDataset):
+        base_dataset = base_dataset._dataset
+    train_indices, val_indices = _split_episode_indices(base_dataset, config.val_fraction, config.seed)
+
+    dataset = transform_dataset(dataset, data_config)
+
+    local_batch_size = config.batch_size // jax.process_count()
+    train_sampler = torch.utils.data.SubsetRandomSampler(train_indices.tolist())
+    val_sampler = torch.utils.data.SubsetRandomSampler(val_indices.tolist())
+
+    train_torch_loader = TorchDataLoader(
+        dataset,
+        local_batch_size=local_batch_size,
+        sharding=sharding,
+        sampler=train_sampler,
+        num_workers=config.num_workers,
+        seed=config.seed,
+        framework=framework,
+    )
+    val_torch_loader = TorchDataLoader(
+        dataset,
+        local_batch_size=local_batch_size,
+        sharding=sharding,
+        sampler=val_sampler,
+        num_workers=0,
+        seed=config.seed,
+        framework=framework,
+    )
+
+    return DataLoaderImpl(data_config, train_torch_loader), DataLoaderImpl(data_config, val_torch_loader)
+
+
 def create_torch_data_loader(
     data_config: _config.DataConfig,
     model_config: _model.BaseModelConfig,
@@ -360,6 +466,7 @@ def create_rlds_data_loader(
     shuffle: bool = False,
     num_batches: int | None = None,
     framework: str = "jax",
+    tfds_split: str = "train",
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
     """Create an RLDS data loader for training.
 
@@ -376,10 +483,11 @@ def create_rlds_data_loader(
         num_batches: Determines the number of batches to return. If the number exceeds the
             number of batches in the dataset, the data loader will loop over the dataset.
             If not provided, will iterate over the dataset indefinitely.
+        tfds_split: The TFDS split string (e.g. "train", "train[:90%]").
     """
     if framework == "pytorch":
         raise NotImplementedError("PyTorch RLDS data loader is not supported yet")
-    dataset = create_rlds_dataset(data_config, action_horizon, batch_size, shuffle=shuffle)
+    dataset = create_rlds_dataset(data_config, action_horizon, batch_size, shuffle=shuffle, tfds_split=tfds_split)
     dataset = transform_iterable_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats, is_batched=True)
 
     data_loader = RLDSDataLoader(

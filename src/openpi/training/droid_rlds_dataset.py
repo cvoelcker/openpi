@@ -123,6 +123,8 @@ class DroidRldsDataset:
         include_next_observation: bool = True,
         include_future_observation: bool = True,
         include_goal_observation: bool = True,
+        # TFDS split string, e.g. "train", "train[:90%]", "train[90%:]".
+        tfds_split: str = "train",
     ):
         # Import tensorflow here to not make it mandatory in case RLDS data loader is not used.
         import dlimp as dl
@@ -140,7 +142,7 @@ class DroidRldsDataset:
             ds_name, version = dataset_cfg.name, dataset_cfg.version
             builder = tfds.builder(ds_name, data_dir=data_dir, version=version)
             dataset = dl.DLataset.from_rlds(
-                builder, split="train", shuffle=shuffle, num_parallel_reads=num_parallel_reads
+                builder, split=tfds_split, shuffle=shuffle, num_parallel_reads=num_parallel_reads
             )
 
             # Filter out any unsuccessful trajectories -- we use the file name to check this
