@@ -42,6 +42,7 @@ dependencies = [
     "polars>=1.30.0",
     "dlimp>=0.0.1",
     "py-spy>=0.4.2",
+    "datasets==3.6.0"
 ]
 
 
