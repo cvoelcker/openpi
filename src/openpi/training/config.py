@@ -553,11 +553,11 @@ class TrainConfig:
     num_train_steps: int = 30_000
 
     # Fraction of episodes to hold out for validation (0.0 = no validation).
-    val_fraction: float = 0.0
+    val_fraction: float = 0.05
     # How often (in steps) to compute validation loss. Only used when val_fraction > 0.
     val_interval: int = 1000
     # Number of batches to average over when computing validation loss.
-    val_batches: int = 10
+    val_batches: int = 50
 
     # How often (in steps) to log training metrics.
     log_interval: int = 100
@@ -1098,6 +1098,46 @@ _CONFIGS = [
         num_train_steps=20_000,
         batch_size=32,
     ),
+    #
+    # REP Learning LIBERO
+    #
+    TrainConfig(
+        # This config is for fine-tuning pi05 on the *full* DROID dataset.
+        # We use RLDS data loading to make training on this large dataset tractable.
+        # For fine-tuning on your own DROID dataset, see below.
+        name="pi05_crl_libero_finetune",
+        model=pi0_config.Pi0RepConfig(
+            pi05=True,
+            action_horizon=16,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m",
+        ),
+        freeze_filter=pi0_config.Pi0RepConfig(
+            pi05=True,
+            action_horizon=16,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=True,
+        ),
+        num_train_steps=30_000,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        batch_size=64,
+        log_interval=100,
+        save_interval=5000,
+        keep_period=10_000,
+    ),
+
     #
     # ALOHA Sim configs. This config is used to demonstrate how to train on a simple simulated environment.
     #
