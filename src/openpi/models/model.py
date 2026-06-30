@@ -312,20 +312,29 @@ def restore_params(
 
     with ocp.PyTreeCheckpointer() as ckptr:
         metadata = ckptr.metadata(params_path)
-        if hasattr(metadata, "item_metadata"):
-            item = {"params": metadata.item_metadata["params"]}
-        else:
-            item = {"params": metadata["params"]}
+        try:
+            if hasattr(metadata, "item_metadata") and metadata.item_metadata is not None:
+                item = {"params": metadata.item_metadata["params"]}
+            else:
+                item = {"params": metadata["params"]}
+        except (TypeError, KeyError):
+            item = None
 
-        params = ckptr.restore(
-            params_path,
-            ocp.args.PyTreeRestore(
-                item=item,
-                restore_args=jax.tree.map(
-                    lambda _: ocp.ArrayRestoreArgs(sharding=sharding, restore_type=restore_type, dtype=dtype), item
+        if item is not None:
+            params = ckptr.restore(
+                params_path,
+                ocp.args.PyTreeRestore(
+                    item=item,
+                    restore_args=jax.tree.map(
+                        lambda _: ocp.ArrayRestoreArgs(sharding=sharding, restore_type=restore_type, dtype=dtype), item
+                    ),
                 ),
-            ),
-        )["params"]
+            )["params"]
+        else:
+            restore_args = ocp.args.PyTreeRestore(
+                restore_args=ocp.args.ArrayRestoreArgs(sharding=sharding, restore_type=restore_type, dtype=dtype),
+            )
+            params = ckptr.restore(params_path, restore_args)["params"]
 
     # If the params were saved with `save_state` during openpi training, every key path will end with "value", which is
     # added by `nnx.State`. We remove the "value" suffix here and always return what NNX calls a "pure dict".
