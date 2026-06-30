@@ -306,11 +306,15 @@ def main(config: _config.TrainConfig):
         donate_argnums=(1,),
     )
 
-    pval_step = jax.jit(
-        val_step,
-        in_shardings=(train_state_sharding, replicated_sharding, data_sharding),
-        out_shardings=replicated_sharding,
-    ) if val_loader is not None else None
+    pval_step = (
+        jax.jit(
+            val_step,
+            in_shardings=(train_state_sharding, replicated_sharding, data_sharding),
+            out_shardings=replicated_sharding,
+        )
+        if val_loader is not None
+        else None
+    )
 
     start_step = int(train_state.step)
     pbar = tqdm.tqdm(
@@ -353,7 +357,6 @@ def main(config: _config.TrainConfig):
 
         if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
             _checkpoints.save_state(checkpoint_manager, train_state, train_loader, step)
-            checkpoint_manager.wait_until_finished()
 
 
 if __name__ == "__main__":
