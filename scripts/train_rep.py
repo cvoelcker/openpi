@@ -245,6 +245,15 @@ def main(config: _config.TrainConfig):
     jax.distributed.initialize()
 
     is_main_process = jax.process_index() == 0
+
+    if config.unique_run_id and jax.process_count() > 1:
+        suffix_bytes = np.array(list(config._run_id_suffix.encode()), dtype=np.uint8)
+        suffix_bytes = jax.experimental.multihost_utils.broadcast_one_to_all(suffix_bytes)
+        synced_suffix = bytes(np.array(suffix_bytes, dtype=np.uint8)).decode()
+        if config._run_id_suffix != synced_suffix:
+            logging.info(f"Synced run_id_suffix: {config._run_id_suffix} -> {synced_suffix}")
+            object.__setattr__(config, "_run_id_suffix", synced_suffix)
+
     logging.info(
         f"Running on: {platform.node()}, process {jax.process_index()}/{jax.process_count()}, "
         f"{jax.local_device_count()} local / {jax.device_count()} total devices"
