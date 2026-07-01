@@ -110,15 +110,14 @@ class Pi0(_model.BaseModel):
             self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
 
-        # prefix and suffix have differing embedding dimensions, which is going to cause some problem? We might need to project one up or down to match?
         self.phi_token = nnx.Param(
             jax.random.uniform(rngs.params(), (1, action_expert_config.width)) / action_expert_config.width
         )
         self.psi_token = nnx.Param(
             jax.random.uniform(rngs.params(), (1, paligemma_config.width)) / paligemma_config.width
         )
-        # assumes phi is smaller than psi, which is correct for default PI setup
-        self.psi_proj = nnx.Linear(paligemma_config.width, action_expert_config.width, rngs=rngs)
+        self.phi_proj = nnx.Linear(action_expert_config.width, config.rep_dim, rngs=rngs)
+        self.psi_proj = nnx.Linear(paligemma_config.width, config.rep_dim, rngs=rngs)
 
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
@@ -258,7 +257,7 @@ class Pi0(_model.BaseModel):
         (prefix_out, _), kv_cache = self.PaliGemma.llm(
             [prefix_tokens, None], mask=prefix_attn_mask, positions=positions
         )
-        backward_rep = prefix_out[:, -1]
+        backward_rep = self.psi_proj(prefix_out[:, -1])
         return backward_rep, kv_cache, prefix_mask, prefix_tokens.shape[1]
 
     def get_forward_representation(
@@ -277,7 +276,7 @@ class Pi0(_model.BaseModel):
         hidden states for action tokens, and v_t is the velocity.
         """
         suffix_out = self._suffix_forward(observation, noisy_actions, timestep, kv_cache, prefix_mask, prefix_len)
-        forward_rep = suffix_out[:, -1]
+        forward_rep = self.phi_proj(suffix_out[:, -1])
         action_hidden = suffix_out[:, -(self.action_horizon + 1) : -1]
         v_t = self.action_out_proj(action_hidden)
         return forward_rep, action_hidden, v_t
@@ -357,9 +356,8 @@ class Pi0(_model.BaseModel):
         action_loss = jnp.mean(jnp.square(v_t - u_t[:orig_batch_size]), axis=-1)
 
         # CRL: phi from current suffix, psi from future prefix.
-        phi = jnp.expand_dims(suffix_out[:orig_batch_size, -1], axis=0)   # (1, B, emb)
-        psi = jnp.expand_dims(prefix_out[orig_batch_size:, -1], axis=1)   # (B, 1, emb)
-        psi = self.psi_proj(psi)
+        phi = jnp.expand_dims(self.phi_proj(suffix_out[:orig_batch_size, -1]), axis=0)   # (1, B, rep_dim)
+        psi = jnp.expand_dims(self.psi_proj(prefix_out[orig_batch_size:, -1]), axis=1)   # (B, 1, rep_dim)
 
         crl_matrix = jnp.sum(phi * psi, axis=-1)   # (B, B): [i, j] = <psi_i, phi_j>
         crl_pos = jnp.diag(crl_matrix)

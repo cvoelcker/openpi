@@ -132,6 +132,7 @@ class Pi0RepConfig(Pi0Config):
     """
 
     pi05: bool = True
+    rep_dim: int = 512
 
     @override
     def create(self, rng: at.KeyArrayLike) -> "Pi0Rep":
