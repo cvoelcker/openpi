@@ -193,6 +193,87 @@ class Pi0(_model.BaseModel):
         ar_mask = jnp.array(ar_mask)
         return tokens, input_mask, ar_mask, adarms_cond
 
+    def _suffix_forward(
+        self,
+        observation: _model.Observation,
+        noisy_actions: _model.Actions,
+        timestep: at.Float[at.Array, "b"],
+        kv_cache,
+        prefix_mask: at.Bool[at.Array, "b s"],
+        prefix_len: int,
+    ):
+        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
+            observation, noisy_actions, timestep
+        )
+        suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
+        prefix_attn_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
+        full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
+        positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
+
+        (_, suffix_out), _ = self.PaliGemma.llm(
+            [None, suffix_tokens],
+            mask=full_attn_mask,
+            positions=positions,
+            kv_cache=kv_cache,
+            adarms_cond=[None, adarms_cond],
+        )
+        return suffix_out
+
+    def get_backward_representation(
+        self, observation: _model.Observation
+    ) -> tuple[at.Float[at.Array, "b emb"], "KVCache", at.Bool[at.Array, "b s"], int]:
+        observation = _model.preprocess_observation(None, observation, train=False)
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        (prefix_out, _), kv_cache = self.PaliGemma.llm(
+            [prefix_tokens, None], mask=prefix_attn_mask, positions=positions
+        )
+        backward_rep = jnp.mean(prefix_out, axis=1)
+        return backward_rep, kv_cache, prefix_mask, prefix_tokens.shape[1]
+
+    def get_forward_representation(
+        self,
+        observation: _model.Observation,
+        noisy_actions: _model.Actions,
+        timestep: at.Float[at.Array, "b"],
+        kv_cache,
+        prefix_mask: at.Bool[at.Array, "b s"],
+        prefix_len: int,
+    ) -> tuple[at.Float[at.Array, "*b emb"], at.Float[at.Array, "*b ah emb"], at.Float[at.Array, "*b ah ad"]]:
+        suffix_out = self._suffix_forward(observation, noisy_actions, timestep, kv_cache, prefix_mask, prefix_len)
+        forward_rep = jnp.mean(suffix_out, axis=1)
+        action_hidden = suffix_out[:, -self.action_horizon:]
+        v_t = self.action_out_proj(action_hidden)
+        return forward_rep, action_hidden, v_t
+
+    def get_prefix_cache(
+        self, observation: _model.Observation
+    ) -> tuple["KVCache", at.Float[at.Array, "b s emb"], at.Bool[at.Array, "b s"]]:
+        observation = _model.preprocess_observation(None, observation, train=False)
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        (prefix_out, _), kv_cache = self.PaliGemma.llm(
+            [prefix_tokens, None], mask=prefix_attn_mask, positions=positions
+        )
+        return kv_cache, prefix_out, prefix_mask
+
+    def compute_velocity_step(
+        self,
+        observation: _model.Observation,
+        x_t: _model.Actions,
+        t_pi0: float | at.Float[at.Array, " b"],
+        kv_cache,
+        prefix_mask: at.Bool[at.Array, "b s"],
+    ) -> at.Float[at.Array, "b ah ad"]:
+        batch_size = x_t.shape[0]
+        timestep = jnp.broadcast_to(jnp.asarray(t_pi0), (batch_size,))
+        prefix_len = prefix_mask.shape[1]
+        suffix_out = self._suffix_forward(observation, x_t, timestep, kv_cache, prefix_mask, prefix_len)
+        action_hidden = suffix_out[:, -self.action_horizon:]
+        return self.action_out_proj(action_hidden)
+
     @override
     def compute_loss(
         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
