@@ -70,6 +70,7 @@ class Pi0(_model.BaseModel):
     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         self.pi05 = config.pi05
+        self.crl_loss_coeff = config.crl_loss_coeff
         paligemma_config = _gemma.get_config(
             config.paligemma_variant,
             lora_rank=config.paligemma_lora_rank,
@@ -155,7 +156,7 @@ class Pi0(_model.BaseModel):
             jnp.broadcast_to(self.psi_token.value[None], (obs.state.shape[0], 1, self.psi_token.value.shape[-1]))
         )
         input_mask.append(jnp.ones((obs.state.shape[0], 1), dtype=jnp.bool_))
-        ar_mask += [False]
+        ar_mask += [True]
         tokens = jnp.concatenate(tokens, axis=1)
         input_mask = jnp.concatenate(input_mask, axis=1)
         ar_mask = jnp.array(ar_mask)
@@ -371,7 +372,7 @@ class Pi0(_model.BaseModel):
         logsumexp_penalty = 0.5 * (jnp.mean(crl_neg_fwd**2) + jnp.mean(crl_neg_bwd**2))
         crl_loss = crl_loss + 0.1 * logsumexp_penalty
 
-        return action_loss + crl_loss, {"action_loss": action_loss, "rep_loss": crl_loss}
+        return action_loss + self.crl_loss_coeff * crl_loss, {"action_loss": action_loss, "rep_loss": crl_loss}
 
     @override
     def sample_actions(
