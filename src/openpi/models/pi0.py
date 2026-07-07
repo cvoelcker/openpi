@@ -107,6 +107,15 @@ class Pi0(_model.BaseModel):
             self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
 
+        # CRL-rep interface (mirrors pi05rep so the steering code can treat both
+        # models uniformly). Baseline pi0 has no learned readout tokens, so the
+        # reps are mean-pooled hidden states: phi = suffix mean (state-action,
+        # action-dependent), psi = prefix mean (state-only, action-independent).
+        self.phi_input = "state_action"
+        self.psi_input = "state"
+        self.phi_dim = action_expert_config.width
+        self.psi_dim = paligemma_config.width
+
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
 

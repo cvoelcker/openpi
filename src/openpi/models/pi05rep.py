@@ -71,6 +71,15 @@ class Pi0(_model.BaseModel):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         self.pi05 = config.pi05
         self.crl_loss_coeff = config.crl_loss_coeff
+        # Training input of each CRL rep. psi (future-time target) is always
+        # state-input; phi (current-time anchor) is configurable.
+        self.phi_input = config.phi_input
+        self.psi_input = "state"
+        self._phi_on_prefix = config.phi_input == "state"
+        # Both reps project to rep_dim, so the critic conditioning size is the
+        # same regardless of which rep is selected downstream.
+        self.phi_dim = config.rep_dim
+        self.psi_dim = config.rep_dim
         paligemma_config = _gemma.get_config(
             config.paligemma_variant,
             lora_rank=config.paligemma_lora_rank,
@@ -111,13 +120,13 @@ class Pi0(_model.BaseModel):
             self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
 
-        self.phi_token = nnx.Param(
-            jax.random.uniform(rngs.params(), (1, action_expert_config.width)) / action_expert_config.width
-        )
+        # With phi_input="state", phi is a prefix token and must match the PaliGemma width.
+        phi_width = paligemma_config.width if self._phi_on_prefix else action_expert_config.width
+        self.phi_token = nnx.Param(jax.random.uniform(rngs.params(), (1, phi_width)) / phi_width)
         self.psi_token = nnx.Param(
             jax.random.uniform(rngs.params(), (1, paligemma_config.width)) / paligemma_config.width
         )
-        self.phi_proj = nnx.Linear(action_expert_config.width, config.rep_dim, rngs=rngs)
+        self.phi_proj = nnx.Linear(phi_width, config.rep_dim, rngs=rngs)
         self.psi_proj = nnx.Linear(paligemma_config.width, config.rep_dim, rngs=rngs)
 
         # This attribute gets automatically set by model.train() and model.eval().
@@ -157,6 +166,15 @@ class Pi0(_model.BaseModel):
         )
         input_mask.append(jnp.ones((obs.state.shape[0], 1), dtype=jnp.bool_))
         ar_mask += [True]
+        if self._phi_on_prefix:
+            # phi joins the prefix right after psi. ar_mask=True keeps image/language
+            # tokens from attending to it; the cumsum in make_attn_mask blocks psi -> phi,
+            # and _prefix_attn_mask explicitly blocks phi -> psi.
+            tokens.append(
+                jnp.broadcast_to(self.phi_token.value[None], (obs.state.shape[0], 1, self.phi_token.value.shape[-1]))
+            )
+            input_mask.append(jnp.ones((obs.state.shape[0], 1), dtype=jnp.bool_))
+            ar_mask += [True]
         tokens = jnp.concatenate(tokens, axis=1)
         input_mask = jnp.concatenate(input_mask, axis=1)
         ar_mask = jnp.array(ar_mask)
@@ -203,17 +221,44 @@ class Pi0(_model.BaseModel):
             action_expert_tokens = action_time_tokens
             adarms_cond = None
         tokens.append(action_expert_tokens)
-        tokens.append(
-            jnp.broadcast_to(self.phi_token.value[None], (obs.state.shape[0], 1, self.phi_token.value.shape[-1]))
-        )
         input_mask.append(jnp.ones(action_expert_tokens.shape[:2], dtype=jnp.bool_))
-        input_mask.append(jnp.ones((obs.state.shape[0], 1), dtype=jnp.bool_))
-        # image/language/state inputs do not attend to action tokens or phi; phi attends to everything in the suffix
-        ar_mask += [True] + ([False] * (self.action_horizon - 1)) + [True]
+        if self._phi_on_prefix:
+            # phi lives on the prefix; the suffix is action tokens only
+            ar_mask += [True] + ([False] * (self.action_horizon - 1))
+        else:
+            tokens.append(
+                jnp.broadcast_to(self.phi_token.value[None], (obs.state.shape[0], 1, self.phi_token.value.shape[-1]))
+            )
+            input_mask.append(jnp.ones((obs.state.shape[0], 1), dtype=jnp.bool_))
+            # image/language/state inputs do not attend to action tokens or phi; phi attends to everything in the suffix
+            ar_mask += [True] + ([False] * (self.action_horizon - 1)) + [True]
         tokens = jnp.concatenate(tokens, axis=1)
         input_mask = jnp.concatenate(input_mask, axis=1)
         ar_mask = jnp.array(ar_mask)
         return tokens, input_mask, ar_mask, adarms_cond
+
+    @property
+    def _num_prefix_rep_tokens(self) -> int:
+        """Number of CRL tokens appended to the prefix (psi, plus phi when phi_input='state')."""
+        return 2 if self._phi_on_prefix else 1
+
+    def _prefix_attn_mask(self, prefix_mask, prefix_ar_mask):
+        """Prefix self-attention mask with rep-token isolation.
+
+        make_attn_mask already blocks psi -> phi (phi has a larger cumulative
+        ar_mask), but phi comes after psi and would attend to it; block that
+        explicitly so the two rep tokens never see each other.
+        """
+        attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        if self._phi_on_prefix:
+            attn_mask = attn_mask.at[:, -1, -2].set(False)
+        return attn_mask
+
+    def _action_hidden(self, suffix_out):
+        """Hidden states of the action tokens (suffix ends with phi only in the default mode)."""
+        if self._phi_on_prefix:
+            return suffix_out[:, -self.action_horizon :]
+        return suffix_out[:, -(self.action_horizon + 1) : -1]
 
     def _suffix_forward(
         self,
@@ -224,13 +269,13 @@ class Pi0(_model.BaseModel):
         prefix_mask: at.Bool[at.Array, "b s"],
         prefix_len: int,
     ):
-        """Shared helper: embed suffix, build masks with psi blocking, run LLM."""
+        """Shared helper: embed suffix, build masks with rep-token blocking, run LLM."""
         suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
             observation, noisy_actions, timestep
         )
         suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
         prefix_attn_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
-        prefix_attn_mask = prefix_attn_mask.at[:, :, prefix_len - 1].set(False)
+        prefix_attn_mask = prefix_attn_mask.at[:, :, prefix_len - self._num_prefix_rep_tokens : prefix_len].set(False)
         full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
         positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
 
@@ -249,17 +294,40 @@ class Pi0(_model.BaseModel):
         """Compute the action-independent (backward) representation.
 
         Returns (backward_rep, kv_cache, prefix_mask, prefix_len) where
-        backward_rep is the psi_token output (last prefix token).
+        backward_rep is the psi_token output (last prefix token, or
+        second-to-last when phi_input="state", where phi is the last one).
         """
         observation = _model.preprocess_observation(None, observation, train=False)
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
-        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        prefix_attn_mask = self._prefix_attn_mask(prefix_mask, prefix_ar_mask)
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
         (prefix_out, _), kv_cache = self.PaliGemma.llm(
             [prefix_tokens, None], mask=prefix_attn_mask, positions=positions
         )
-        backward_rep = self.psi_proj(prefix_out[:, -1])
+        backward_rep = self.psi_proj(prefix_out[:, -self._num_prefix_rep_tokens])
         return backward_rep, kv_cache, prefix_mask, prefix_tokens.shape[1]
+
+    def get_state_representations(
+        self, observation: _model.Observation
+    ) -> tuple[at.Float[at.Array, "b emb"], at.Float[at.Array, "b emb"], "KVCache", at.Bool[at.Array, "b s"], int]:
+        """State-only mode: compute both representations from a single prefix pass.
+
+        Returns (backward_rep, forward_rep, kv_cache, prefix_mask, prefix_len).
+        Both reps are action-independent; use this instead of
+        get_forward_representation when phi_input="state".
+        """
+        if not self._phi_on_prefix:
+            raise ValueError("get_state_representations requires phi_input='state'")
+        observation = _model.preprocess_observation(None, observation, train=False)
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        prefix_attn_mask = self._prefix_attn_mask(prefix_mask, prefix_ar_mask)
+        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        (prefix_out, _), kv_cache = self.PaliGemma.llm(
+            [prefix_tokens, None], mask=prefix_attn_mask, positions=positions
+        )
+        backward_rep = self.psi_proj(prefix_out[:, -2])
+        forward_rep = self.phi_proj(prefix_out[:, -1])
+        return backward_rep, forward_rep, kv_cache, prefix_mask, prefix_tokens.shape[1]
 
     def get_forward_representation(
         self,
@@ -275,10 +343,18 @@ class Pi0(_model.BaseModel):
         Returns (forward_rep, action_hidden, v_t) where forward_rep is the
         phi_token output (last suffix token), action_hidden is the transformer
         hidden states for action tokens, and v_t is the velocity.
+
+        Not available with phi_input="state" (phi is not part of the suffix there);
+        use get_state_representations + compute_velocity_step instead.
         """
+        if self._phi_on_prefix:
+            raise ValueError(
+                "get_forward_representation requires phi_input='state_action' (suffix phi); "
+                "with phi_input='state' use get_state_representations and compute_velocity_step."
+            )
         suffix_out = self._suffix_forward(observation, noisy_actions, timestep, kv_cache, prefix_mask, prefix_len)
         forward_rep = self.phi_proj(suffix_out[:, -1])
-        action_hidden = suffix_out[:, -(self.action_horizon + 1) : -1]
+        action_hidden = self._action_hidden(suffix_out)
         v_t = self.action_out_proj(action_hidden)
         return forward_rep, action_hidden, v_t
 
@@ -288,7 +364,7 @@ class Pi0(_model.BaseModel):
         """Compatibility wrapper: returns (kv_cache, prefix_hidden, prefix_mask)."""
         observation = _model.preprocess_observation(None, observation, train=False)
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
-        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        prefix_attn_mask = self._prefix_attn_mask(prefix_mask, prefix_ar_mask)
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
         (prefix_out, _), kv_cache = self.PaliGemma.llm(
             [prefix_tokens, None], mask=prefix_attn_mask, positions=positions
@@ -308,8 +384,7 @@ class Pi0(_model.BaseModel):
         timestep = jnp.broadcast_to(jnp.asarray(t_pi0), (batch_size,))
         prefix_len = prefix_mask.shape[1]
         suffix_out = self._suffix_forward(observation, x_t, timestep, kv_cache, prefix_mask, prefix_len)
-        action_hidden = suffix_out[:, -(self.action_horizon + 1) : -1]
-        return self.action_out_proj(action_hidden)
+        return self.action_out_proj(self._action_hidden(suffix_out))
 
     def compute_loss(
         self,
@@ -344,9 +419,15 @@ class Pi0(_model.BaseModel):
         input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
         ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
         attn_mask = make_attn_mask(input_mask, ar_mask)
-        # psi_token is the last prefix token; block suffix tokens from attending to it
+        # The rep tokens sit at the end of the prefix (psi, plus phi when phi_input="state"
+        # mode); block all suffix tokens from attending to them.
         prefix_len = prefix_tokens.shape[1]
-        attn_mask = attn_mask.at[:, prefix_len:, prefix_len - 1].set(False)
+        num_rep = self._num_prefix_rep_tokens
+        attn_mask = attn_mask.at[:, prefix_len:, prefix_len - num_rep : prefix_len].set(False)
+        if self._phi_on_prefix:
+            # make_attn_mask already blocks psi -> phi; block phi -> psi so the
+            # two rep tokens never attend to each other.
+            attn_mask = attn_mask.at[:, prefix_len - 1, prefix_len - 2].set(False)
         positions = jnp.cumsum(input_mask, axis=1) - 1
         (prefix_out, suffix_out), _ = self.PaliGemma.llm(
             [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions, adarms_cond=[None, adarms_cond]
@@ -356,9 +437,14 @@ class Pi0(_model.BaseModel):
         v_t = self.action_out_proj(suffix_out[:orig_batch_size, : self.action_horizon])
         action_loss = jnp.mean(jnp.square(v_t - u_t[:orig_batch_size]), axis=-1)
 
-        # CRL: phi from current suffix, psi from future prefix.
-        phi = jnp.expand_dims(self.phi_proj(suffix_out[:orig_batch_size, -1]), axis=0)   # (1, B, rep_dim)
-        psi = jnp.expand_dims(self.psi_proj(prefix_out[orig_batch_size:, -1]), axis=1)   # (B, 1, rep_dim)
+        if self._phi_on_prefix:
+            # CRL: both reps from the prefix — phi from the current obs, psi from the future obs.
+            phi = jnp.expand_dims(self.phi_proj(prefix_out[:orig_batch_size, -1]), axis=0)    # (1, B, rep_dim)
+            psi = jnp.expand_dims(self.psi_proj(prefix_out[orig_batch_size:, -2]), axis=1)    # (B, 1, rep_dim)
+        else:
+            # CRL: phi from current suffix, psi from future prefix.
+            phi = jnp.expand_dims(self.phi_proj(suffix_out[:orig_batch_size, -1]), axis=0)   # (1, B, rep_dim)
+            psi = jnp.expand_dims(self.psi_proj(prefix_out[orig_batch_size:, -1]), axis=1)   # (B, 1, rep_dim)
 
         crl_matrix = jnp.sum(phi * psi, axis=-1)   # (B, B): [i, j] = <psi_i, phi_j>
         crl_pos = jnp.diag(crl_matrix)
@@ -393,7 +479,7 @@ class Pi0(_model.BaseModel):
 
         # first fill KV cache with a forward pass of the prefix
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
-        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        prefix_attn_mask = self._prefix_attn_mask(prefix_mask, prefix_ar_mask)
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
         _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
 
@@ -409,7 +495,7 @@ class Pi0(_model.BaseModel):
                 prefix_mask,
                 prefix_len,
             )
-            v_t = self.action_out_proj(suffix_out[:, -(self.action_horizon + 1) : -1])
+            v_t = self.action_out_proj(self._action_hidden(suffix_out))
 
             return x_t + dt * v_t, time + dt
 

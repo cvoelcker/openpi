@@ -134,6 +134,21 @@ class Pi0RepConfig(Pi0Config):
     pi05: bool = True
     rep_dim: int = 512
     crl_loss_coeff: float = 0.01
+    # Input the phi (current-time CRL anchor) representation is trained on:
+    # "state_action" — phi token lives on the action suffix and sees the noisy
+    # action tokens (Q-value style, the default); "state" — phi token joins psi
+    # on the prefix (the state-only portion of the VLA backbone), making both
+    # representations action-independent (state-value style). psi (the future-
+    # time CRL target) is always state-input by design. The two rep tokens
+    # never attend to each other.
+    phi_input: str = "state_action"
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.phi_input not in ("state_action", "state"):
+            raise ValueError(
+                f"phi_input must be 'state_action' or 'state', got {self.phi_input!r}"
+            )
 
     @override
     def create(self, rng: at.KeyArrayLike) -> "Pi0Rep":
