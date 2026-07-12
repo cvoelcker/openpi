@@ -60,7 +60,7 @@ uv run scripts/serve_policy.py policy:checkpoint --policy.config=pi05_libero --p
   - `shared/` — utilities: array typing, normalization, download, image tools
   - `transforms.py` — core `DataTransformFn` protocol and `Group` composition
 - `packages/openpi-client/` — lightweight client package (minimal deps, Python 3.7+) for connecting robots to the policy server via WebSocket
-- `scripts/` — entry points: `train.py`, `train_pytorch.py`, `serve_policy.py`, `compute_norm_stats.py`
+- `scripts/` — entry points: `train.py`, `train_rep.py` (goal-conditioned/representation learning), `train_pytorch.py`, `serve_policy.py`, `compute_norm_stats.py`
 - `examples/` — robot-specific examples (aloha_sim, aloha_real, droid, libero, ur5)
 
 ### Data Flow
@@ -105,3 +105,11 @@ Set `XLA_PYTHON_CLIENT_MEM_FRACTION=0.9` before training to allow JAX to use 90%
 ### Checkpoints
 
 Checkpoints auto-download from `gs://openpi-assets` and cache in `~/.cache/openpi`. Override with `OPENPI_DATA_HOME` env var. PyTorch checkpoints are detected by presence of `model.safetensors`; JAX checkpoints have a `params/` directory.
+
+### Important: Parallel Training Scripts
+
+There are **two** JAX training scripts that must be kept in sync:
+- `scripts/train.py` — standard supervised training
+- `scripts/train_rep.py` — goal-conditioned / representation learning training (uses `rl_data_loader.py` with HER-style sampling)
+
+When modifying training infrastructure (data loading, config, checkpointing, val splits, etc.), **always update both scripts**. `train_rep.py` uses `GoalConditionedBatch` dicts instead of `(Observation, Actions)` tuples, and its data loader is `rl_data_loader.create_goal_conditioned_data_loader`.
