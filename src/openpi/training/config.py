@@ -1486,6 +1486,7 @@ _CONFIGS = [
             action_horizon=10,
             discrete_state_input=False,
             phi_input="state",
+            rep_dim=2048,
         ),
         data=LeRobotLiberoDataConfig(
             repo_id="physical-intelligence/libero",
