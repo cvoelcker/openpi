@@ -370,7 +370,14 @@ def run_smoke_test(args):
 
 
 def main():
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+    # force=True resets any handlers already installed by absl/jax on import, otherwise
+    # basicConfig is a no-op and our INFO logs get dropped (root stays at WARNING).
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        force=True,
+    )
+    logger.setLevel(logging.INFO)
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("config_name", nargs="?", help="Registered TrainConfig name (e.g. pi05_libero_rep).")
     p.add_argument("--checkpoint", help="Path to a params checkpoint dir (…/<step>/params).")
