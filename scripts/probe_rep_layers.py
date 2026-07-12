@@ -45,6 +45,7 @@ Smoke-test the probe-fitting logic locally (no backbone, no checkpoint):
 import argparse
 import dataclasses
 import logging
+import time
 
 import flax.nnx as nnx
 import jax
@@ -115,12 +116,22 @@ def fit_probe(
         loss, acc = _infonce(phi, psi)
         return loss, acc
 
+    # Whole training loop in one jitted scan: minibatch sampling, gather, and the
+    # optimizer step all run on-device, so there's no per-step Python/dispatch overhead.
     @jax.jit
-    def train_step(params, opt_state, c, f):
-        (loss, acc), grads = jax.value_and_grad(loss_fn, has_aux=True)(params, c, f)
-        updates, opt_state = opt.update(grads, opt_state)
-        params = optax.apply_updates(params, updates)
-        return params, opt_state, loss, acc
+    def train_loop(params, opt_state, rng):
+        def step(carry, step_rng):
+            params, opt_state = carry
+            idx = jax.random.choice(step_rng, train_c.shape[0], (batch,), replace=False)
+            (_loss, _acc), grads = jax.value_and_grad(loss_fn, has_aux=True)(
+                params, train_c[idx], train_f[idx]
+            )
+            updates, opt_state = opt.update(grads, opt_state)
+            params = optax.apply_updates(params, updates)
+            return (params, opt_state), None
+
+        (params, opt_state), _ = jax.lax.scan(step, (params, opt_state), jax.random.split(rng, steps))
+        return params, opt_state
 
     @jax.jit
     def eval_metrics(params, c, f):
@@ -136,11 +147,7 @@ def fit_probe(
         _, (losses, accs) = jax.lax.scan(body, None, (c, f))
         return losses.mean(), accs.mean()
 
-    n_train = train_c.shape[0]
-    for i in range(steps):
-        idx = jax.random.choice(jax.random.fold_in(key, i), n_train, (batch,), replace=False)
-        params, opt_state, _, _ = train_step(params, opt_state, train_c[idx], train_f[idx])
-
+    params, opt_state = train_loop(params, opt_state, key)
     tr_loss, tr_acc = eval_metrics(params, train_c, train_f)
     va_loss, va_acc = eval_metrics(params, val_c, val_f)
     return {
@@ -205,9 +212,18 @@ def cache_features(feature_fn, state, loader, num_batches: int):
       per_layer_*: (L, N, key_dim); final_*: (N, width).
     """
     layer_c, layer_f, fin_c, fin_f = [], [], [], []
+    logger.info("fetching first batch (spawning data workers; may take a while)...")
     it = iter(loader)
     for b in range(num_batches):
+        t0 = time.time()
         batch = next(it)
+        if b == 0:
+            logger.info(
+                "first batch fetched in %.1fs; running first forward "
+                "(JIT-compiling the backbone, can take several minutes)...",
+                time.time() - t0,
+            )
+        tf = time.time()
         per_layer, final_res = feature_fn(state, batch["observation"], batch["future_observation"])
         per_layer = np.asarray(jax.device_get(per_layer))
         final_res = np.asarray(jax.device_get(final_res))
@@ -216,8 +232,9 @@ def cache_features(feature_fn, state, loader, num_batches: int):
         layer_f.append(per_layer[:, bsz:])
         fin_c.append(final_res[:bsz])
         fin_f.append(final_res[bsz:])
-        if (b + 1) % 10 == 0:
-            logger.info("cached %d/%d batches", b + 1, num_batches)
+        # Log every batch for the first few (so the first compile is visible), then every 10.
+        if b < 3 or (b + 1) % 10 == 0:
+            logger.info("cached %d/%d batches (forward %.1fs)", b + 1, num_batches, time.time() - tf)
     return (
         np.concatenate(layer_c, axis=1),
         np.concatenate(layer_f, axis=1),
@@ -280,19 +297,22 @@ def run_probe(args):
     mesh = sharding.make_mesh(1)
     data_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(sharding.DATA_AXIS))
 
-    logger.info("building model + loading checkpoint from %s", args.checkpoint)
+    logger.info("building model...")
     model = config.model.create(jax.random.key(0))
+    logger.info("restoring checkpoint params from %s (this can take a while)...", args.checkpoint)
     # Preserve the checkpoint's dtypes; the LLM casts activations to its embed_dtype
     # internally, so mixed fp32/bf16 params are fine for a frozen forward.
     params = _model.restore_params(args.checkpoint)
     graphdef, state = nnx.split(model)
     state.replace_by_pure_dict(params)
+    logger.info("params restored; building data loaders (loads the LeRobot dataset)...")
 
     train_loader, val_loader = _rl_data_loader.create_train_val_goal_conditioned_data_loaders(
         config, sharding=data_sharding
     )
     if val_loader is None:
         raise ValueError("No val loader was created.")
+    logger.info("data loaders ready.")
 
     feature_fn = build_feature_fn(graphdef)
     logger.info("caching train features (%d batches)", args.train_batches)
