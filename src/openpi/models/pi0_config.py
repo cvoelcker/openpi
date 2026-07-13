@@ -138,8 +138,10 @@ class Pi0RepConfig(Pi0Config):
     # Weight on the flow-matching action loss. 1.0 = normal joint training; 0.0
     # switches the action loss off entirely for pure representation learning. Note:
     # with action_loss_coeff=0.0 AND rep_backbone_grad_scale=0.0 the backbone gets
-    # no gradient (heads train on a frozen backbone); raise rep_backbone_grad_scale
-    # to train the backbone from the rep loss alone.
+    # no gradient, so `get_freeze_filter` freezes it outright (see `backbone_frozen`):
+    # only the phi/psi heads are trainable and the backbone's backward pass and
+    # optimizer state are skipped. Raise rep_backbone_grad_scale to instead train
+    # the backbone from the rep loss alone.
     action_loss_coeff: float = 1.0
     # Number of gemma blocks in each (phi/psi) representation head. Per-config
     # hyperparameter: raise for more head capacity, lower (e.g. 1) for leaner heads.
@@ -163,6 +165,28 @@ class Pi0RepConfig(Pi0Config):
             raise ValueError(
                 f"phi_input must be 'state_action' or 'state', got {self.phi_input!r}"
             )
+
+    @property
+    def backbone_frozen(self) -> bool:
+        """True when the shared backbone receives no gradient and can be frozen.
+
+        This holds when the action loss is off (``action_loss_coeff == 0.0``) AND no
+        rep-loss gradient leaks into the backbone (``rep_backbone_grad_scale == 0.0``).
+        In that regime only the phi/psi rep heads are trainable, so the backbone's
+        backward pass and optimizer state can be skipped entirely.
+        """
+        return self.action_loss_coeff == 0.0 and self.rep_backbone_grad_scale == 0.0
+
+    @override
+    def get_freeze_filter(self) -> nnx.filterlib.Filter:
+        # When the backbone gets no gradient, freeze everything except the rep heads
+        # (phi/psi head blocks, layer-mix logits, and output projections). This drops
+        # the backbone from the trainable set, so its backward pass and optimizer
+        # state are never materialized — a large speed and memory win.
+        if self.backbone_frozen:
+            rep_head_filter = nnx_utils.PathRegex(r".*(phi|psi)_(head|mix|proj).*")
+            return nnx.Not(rep_head_filter)
+        return super().get_freeze_filter()
 
     @override
     def create(self, rng: at.KeyArrayLike) -> "Pi0Rep":

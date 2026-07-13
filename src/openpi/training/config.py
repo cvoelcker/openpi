@@ -1164,6 +1164,47 @@ _CONFIGS = [
     ),
 
     TrainConfig(
+        # Pure representation learning on a frozen backbone: rep_dim=2048 phi/psi heads,
+        # action loss off and no rep-loss leak into the backbone (action_loss_coeff=0.0,
+        # rep_backbone_grad_scale=0.0). backbone_frozen is True, so only the phi/psi heads
+        # train — the backbone's backward pass and optimizer state are skipped. The
+        # freeze_filter builder mirrors those coeffs so the freeze actually takes effect.
+        name="pi05_crl_libero_full_finetune_frozen",
+        model=pi0_config.Pi0RepConfig(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            rep_dim=2048,
+            action_loss_coeff=0.0,
+            rep_backbone_grad_scale=0.0,
+        ),
+        freeze_filter=pi0_config.Pi0RepConfig(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            rep_dim=2048,
+            action_loss_coeff=0.0,
+            rep_backbone_grad_scale=0.0,
+        ).get_freeze_filter(),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+    ),
+
+    TrainConfig(
         name="pi05_crl_libero_full_finetune_pretrained",
         model=pi0_config.Pi0RepConfig(
             pi05=True,
