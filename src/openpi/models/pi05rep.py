@@ -546,16 +546,17 @@ class Pi0(_model.BaseModel):
             crl_self_neg = logit_scale * jnp.sum(phi_flat * psi_neg, axis=-1)  # (B,): [j] = <phi_j, psi_neg_j>
             over_psi_logits = jnp.concatenate([crl_matrix, crl_self_neg[None, :]], axis=0)  # (B+1, B)
         else:
+            crl_self_neg = None
             over_psi_logits = crl_matrix
 
         # Symmetric InfoNCE: contrast over anchors (axis=1) AND over futures (axis=0).
         crl_neg_over_phi = jax.nn.logsumexp(crl_matrix, axis=1)  # future psi_i, normalize over phi anchors
         crl_neg_over_psi = jax.nn.logsumexp(over_psi_logits, axis=0)  # anchor phi_j, normalize over psi (+ its neg)
-        crl_loss = 0.5 * jnp.mean((crl_neg_over_phi - crl_pos) + (crl_neg_over_psi - crl_pos))
+        crl_infonce = 0.5 * jnp.mean((crl_neg_over_phi - crl_pos) + (crl_neg_over_psi - crl_pos))
 
         # Logsumexp penalty (guards against logit blow-up / collapse); coeff is a config knob.
         logsumexp_penalty = 0.5 * (jnp.mean(crl_neg_over_phi**2) + jnp.mean(crl_neg_over_psi**2))
-        crl_loss = crl_loss + self.logsumexp_penalty_coeff * logsumexp_penalty
+        crl_loss = crl_infonce + self.logsumexp_penalty_coeff * logsumexp_penalty
 
         # Diagnostics (meaned by the train loop). Pre-normalization rep norms confirm whether the
         # heads were inflating norms; layer-mix entropy watches for mix collapse; collision_rate is
@@ -571,11 +572,39 @@ class Pi0(_model.BaseModel):
             "phi_mix_max": jnp.max(phi_mix_w),
             "psi_mix_max": jnp.max(psi_mix_w),
         }
+        if crl_self_neg is not None:
+            # Within-task discrimination readout (compute-only, NOT in total_loss): a pure 2-way
+            # InfoNCE contrasting each anchor's true future (crl_pos[j] = <psi_j, phi_j>) against
+            # its own within-task hard negative (crl_self_neg[j] = <phi_j, psi_neg_j>). Both share
+            # anchor phi_j, so this isolates whether the head separates *states within a task* —
+            # the shortcut-proof signal (prompt/scene fingerprints cancel). Bounded by ln(2)≈0.693
+            # (chance for 2 candidates); →0 = perfect within-task discrimination.
+            diagnostics["within_task_loss"] = jnp.mean(jnp.logaddexp(crl_pos, crl_self_neg) - crl_pos)
         if episode_id is not None:
             same_ep = episode_id[:, None] == episode_id[None, :]  # (B, B)
             off_diag = ~jnp.eye(B, dtype=jnp.bool_)
             n_off = jnp.sum(off_diag)
             diagnostics["collision_rate"] = jnp.sum(same_ep & off_diag) / jnp.maximum(n_off, 1)
+
+            # Compute-only confound probe (NOT in total_loss, no backprop): recompute the InfoNCE
+            # term with same-episode off-diagonal pairs removed from the denominator. These pairs
+            # are false negatives (genuinely similar frames penalized as negatives); val batches
+            # carry ~14x more of them than train (tiny val episode pool), so if the train/val gap
+            # is a collision artifact rather than memorization, rep_loss_masked closes it while
+            # rep_loss_nomask reproduces the gap. Diagonal (positive) is never masked.
+            false_neg = same_ep & off_diag  # (B, B)
+            masked_crl = jnp.where(false_neg, -1e9, crl_matrix)
+            if negative_observation is not None:
+                masked_over_psi = jnp.concatenate([masked_crl, crl_self_neg[None, :]], axis=0)
+            else:
+                masked_over_psi = masked_crl
+            masked_neg_over_phi = jax.nn.logsumexp(masked_crl, axis=1)
+            masked_neg_over_psi = jax.nn.logsumexp(masked_over_psi, axis=0)
+            diagnostics["rep_loss_masked"] = 0.5 * jnp.mean(
+                (masked_neg_over_phi - crl_pos) + (masked_neg_over_psi - crl_pos)
+            )
+            # Unmasked InfoNCE (no penalty) as the apples-to-apples reference for rep_loss_masked.
+            diagnostics["rep_loss_nomask"] = crl_infonce
 
         total_loss = self.action_loss_coeff * action_loss + self.crl_loss_coeff * crl_loss
         return total_loss, {"action_loss": action_loss, "rep_loss": crl_loss, **diagnostics}
