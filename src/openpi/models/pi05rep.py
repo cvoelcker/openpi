@@ -514,8 +514,12 @@ class Pi0(_model.BaseModel):
 
         # L2-normalize reps onto the unit sphere so InfoNCE logits are cosine similarities.
         # This removes the norm-inflation shortcut (driving train loss down by growing ||rep||
-        # rather than improving alignment) and forces the heads to separate directions.
+        # rather than improving alignment) and forces the heads to separate directions. Cast to
+        # float32 first — reps come out of the projection in the (bf16) embed dtype, and the
+        # normalization + logit/logsumexp math wants full precision.
         eps = 1e-6
+        phi_raw = phi_raw.astype(jnp.float32)
+        psi_raw = psi_raw.astype(jnp.float32)
         phi_flat = phi_raw / (jnp.linalg.norm(phi_raw, axis=-1, keepdims=True) + eps)
         psi_flat = psi_raw / (jnp.linalg.norm(psi_raw, axis=-1, keepdims=True) + eps)
         # Learnable temperature (clamped) restores separability of the bounded cosine logits.
@@ -537,6 +541,7 @@ class Pi0(_model.BaseModel):
                 deterministic=deterministic,
                 dropout_rng=neg_drop_rng,
             )  # (B, d)
+            psi_neg_raw = psi_neg_raw.astype(jnp.float32)
             psi_neg = psi_neg_raw / (jnp.linalg.norm(psi_neg_raw, axis=-1, keepdims=True) + eps)
             crl_self_neg = logit_scale * jnp.sum(phi_flat * psi_neg, axis=-1)  # (B,): [j] = <phi_j, psi_neg_j>
             over_psi_logits = jnp.concatenate([crl_matrix, crl_self_neg[None, :]], axis=0)  # (B+1, B)
