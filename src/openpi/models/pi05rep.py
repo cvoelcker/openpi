@@ -394,6 +394,7 @@ class Pi0(_model.BaseModel):
         actions: _model.Actions,
         *,
         train: bool = False,
+        episode_id: at.Int[at.Array, " b"] | None = None,
     ) -> at.Float[at.Array, "*b ah"]:
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
@@ -447,6 +448,18 @@ class Pi0(_model.BaseModel):
             psi = jnp.expand_dims(self.psi_proj(prefix_out[orig_batch_size:, -1]), axis=1)   # (B, 1, rep_dim)
 
         crl_matrix = jnp.sum(phi * psi, axis=-1)   # (B, B): [i, j] = <psi_i, phi_j>
+
+        # Mask same-episode off-diagonal pairs. future_i shares anchor i's episode, so
+        # entry [i, j] is a same-episode pair iff episode_id[i] == episode_id[j]. Those
+        # off-diagonal entries are false negatives (temporally-close, near-duplicate
+        # frames) that would otherwise be contrasted against the positive and inflate the
+        # loss. Setting them very negative removes them from both logsumexp reductions;
+        # the diagonal (the true positive) is always kept.
+        if episode_id is not None:
+            same_ep = episode_id[:, None] == episode_id[None, :]  # (B, B)
+            false_neg = same_ep & ~jnp.eye(orig_batch_size, dtype=bool)
+            crl_matrix = jnp.where(false_neg, -2.3819763e38, crl_matrix)
+
         crl_pos = jnp.diag(crl_matrix)
 
         # Symmetric InfoNCE: contrast over current states (axis=1) AND over futures (axis=0).

@@ -54,6 +54,9 @@ class GoalConditionedBatch(TypedDict, total=False):
     next_is_pad: at.Array
     future_is_pad: at.Array
     goal_is_pad: at.Array
+    # Per-sample episode identifier (the anchor frame's episode). Used to mask
+    # same-episode entries out of the in-batch contrastive negatives.
+    episode_id: at.Array
 
 logger = logging.getLogger(__name__)
 
@@ -178,7 +181,9 @@ class RandomFutureDataset(_data_loader.Dataset):
         def _obs_only(sample: dict) -> dict:
             return {k: v for k, v in sample.items() if k != "actions"}
 
-        item = {"observation": _obs_only(anchor)}
+        # The episode-start frame index uniquely identifies the anchor's episode; equal
+        # values mean same episode. Used downstream to mask same-episode contrastive negatives.
+        item = {"observation": _obs_only(anchor), "episode_id": np.int64(self._ep_start[t])}
         if self._include_next:
             item["next_observation"] = _obs_only(self._dataset[next_idx])
             item["next_is_pad"] = pads["next_is_pad"]
@@ -209,7 +214,7 @@ class GoalConditionedDataLoader(_data_loader.DataLoader):
             for key in ("next_observation", "future_observation", "goal_observation"):
                 if key in batch:
                     out[key] = _model.Observation.from_dict(batch[key])
-            for key in ("next_is_pad", "future_is_pad", "goal_is_pad"):
+            for key in ("next_is_pad", "future_is_pad", "goal_is_pad", "episode_id"):
                 if key in batch:
                     out[key] = batch[key]
             if "actions" in batch:
@@ -265,7 +270,7 @@ class IterableHERTransformedDataset(_data_loader.IterableDataset):
         for key in ("next_observation", "future_observation", "goal_observation"):
             if key in sample:
                 result[key] = _transform_aux(sample[key])
-        for key in ("next_is_pad", "future_is_pad", "goal_is_pad"):
+        for key in ("next_is_pad", "future_is_pad", "goal_is_pad", "episode_id"):
             if key in sample:
                 result[key] = sample[key]
         if actions is not None:
