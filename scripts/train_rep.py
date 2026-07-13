@@ -159,6 +159,10 @@ def train_step(
     model = nnx.merge(state.model_def, state.params)
     model.train()
 
+    # next_*: SARSA TD inputs used only by the SF model. The CRL model keeps its exact
+    # compute_loss signature (no next_*), so forward these only when the batch provides them.
+    sf_kwargs = {k: batch[k] for k in ("next_observation", "next_actions", "next_is_pad") if k in batch}
+
     @at.typecheck
     def loss_fn(
         model: _model.BaseModel,
@@ -167,7 +171,14 @@ def train_step(
         future_observation: _model.Observation,
         actions: _model.Actions,
     ):
-        chunked_loss, log_dict = model.compute_loss(rng, observation, future_observation, actions, train=True)
+        chunked_loss, log_dict = model.compute_loss(
+            rng,
+            observation,
+            future_observation,
+            actions,
+            train=True,
+            **sf_kwargs,
+        )
         return jnp.mean(chunked_loss), log_dict
 
     train_rng = jax.random.fold_in(rng, state.step)
@@ -211,8 +222,9 @@ def train_step(
         "loss": loss,
         "grad_norm": optax.global_norm(grads),
         "param_norm": optax.global_norm(kernel_params),
-        "action_loss": log_dict["action_loss"],
-        "rep_loss": log_dict["rep_loss"],
+        # Forward all model-reported metrics generically (CRL: rep_loss;
+        # SF: sf_loss/phi_norm/psi_norm/sf_td_resid; plus action_loss for both).
+        **log_dict,
     }
     return new_state, info
 

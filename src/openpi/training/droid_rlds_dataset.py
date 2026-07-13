@@ -300,6 +300,9 @@ class DroidRldsDataset:
                     if include_next_observation:
                         traj["next_observation"] = gather_obs(traj["observation"], next_indices)
                         traj["next_is_pad"] = next_is_pad
+                        # Action chunk at the next step (SARSA a' for successor-feature training).
+                        # Gathered raw here; normalized downstream alongside next_observation.
+                        traj["next_actions"] = tf.gather(traj["actions"], next_indices)
                     if include_future_observation:
                         traj["future_observation"] = gather_obs(traj["observation"], future_indices)
                         traj["future_is_pad"] = tf.logical_not(has_future)

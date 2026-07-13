@@ -155,3 +155,24 @@ class Pi0RepConfig(Pi0Config):
         from openpi.models.pi05rep import Pi0 as Pi0Rep
 
         return Pi0Rep(self, rngs=nnx.Rngs(rng))
+
+
+@dataclasses.dataclass(frozen=True)
+class Pi0SFConfig(Pi0Config):
+    """Config for the TD Successor-Features variant of Pi0.
+
+    Identical backbone to Pi0Config (pi05=True) but instantiates pi05sf.Pi0SF, which adds
+    a feature token phi(s) and a successor token psi(s,a) trained with a semi-gradient
+    SARSA TD loss alongside the flow-matching action loss.
+    """
+
+    pi05: bool = True
+    sf_dim: int = 256  # dimension of phi/psi successor features
+    sf_gamma: float = 0.98  # TD discount
+    fb_train_goal_ratio: float = 0.5  # fraction of the batch whose z = B(future); rest random
+
+    @override
+    def create(self, rng: at.KeyArrayLike) -> "Pi0SF":  # noqa: F821
+        from openpi.models.pi05sf import Pi0SF
+
+        return Pi0SF(self, rngs=nnx.Rngs(rng))

@@ -51,6 +51,7 @@ class GoalConditionedBatch(TypedDict, total=False):
     future_observation: _model.Observation
     goal_observation: _model.Observation
     actions: at.Float[at.Array, "*b ah ad"]
+    next_actions: at.Float[at.Array, "*b ah ad"]
     next_is_pad: at.Array
     future_is_pad: at.Array
     goal_is_pad: at.Array
@@ -214,6 +215,8 @@ class GoalConditionedDataLoader(_data_loader.DataLoader):
                     out[key] = batch[key]
             if "actions" in batch:
                 out["actions"] = batch["actions"]
+            if "next_actions" in batch:
+                out["next_actions"] = batch["next_actions"]
             yield out
 
 
@@ -247,22 +250,41 @@ class IterableHERTransformedDataset(_data_loader.IterableDataset):
     def _transform_sample(self, sample: dict) -> dict:
         prompt = sample.get("prompt")
 
-        def _build_obs_input(obs_dict, *, include_actions: bool) -> dict:
+        def _build_obs_input(obs_dict, *, actions=None) -> dict:
             inp = {"observation": obs_dict}
             if prompt is not None:
                 inp["prompt"] = prompt
-            if include_actions:
-                inp["actions"] = sample["actions"]
+            if actions is not None:
+                # RLDS actions are read-only; DeltaActions/AbsoluteActions mutate in place
+                # (upstream dropped their internal .copy()), so hand them a writable copy.
+                inp["actions"] = np.array(actions)
             return inp
 
-        anchor_out = self._transform_fn(_build_obs_input(sample["observation"], include_actions=True))
+        anchor_out = self._transform_fn(_build_obs_input(sample["observation"], actions=sample["actions"]))
         actions = anchor_out.pop("actions", None)
 
         def _transform_aux(obs_dict) -> dict:
-            return self._aux_transform_fn(_build_obs_input(obs_dict, include_actions=False))
+            return self._aux_transform_fn(_build_obs_input(obs_dict))
+
+        # next_observation is transformed through the anchor pipeline together with its
+        # action chunk, so next_actions is normalized identically to actions (SARSA a'
+        # for successor-feature training). future/goal carry no actions, as before.
+        next_actions = None
+        next_observation = None
+        if "next_observation" in sample:
+            if "next_actions" in sample:
+                next_out = self._transform_fn(
+                    _build_obs_input(sample["next_observation"], actions=sample["next_actions"])
+                )
+                next_actions = next_out.pop("actions", None)
+                next_observation = next_out
+            else:
+                next_observation = _transform_aux(sample["next_observation"])
 
         result = {"observation": anchor_out}
-        for key in ("next_observation", "future_observation", "goal_observation"):
+        if next_observation is not None:
+            result["next_observation"] = next_observation
+        for key in ("future_observation", "goal_observation"):
             if key in sample:
                 result[key] = _transform_aux(sample[key])
         for key in ("next_is_pad", "future_is_pad", "goal_is_pad"):
@@ -270,6 +292,8 @@ class IterableHERTransformedDataset(_data_loader.IterableDataset):
                 result[key] = sample[key]
         if actions is not None:
             result["actions"] = actions
+        if next_actions is not None:
+            result["next_actions"] = next_actions
         return result
 
     def __len__(self) -> int:
