@@ -223,8 +223,9 @@ def train_step(
         "loss": loss,
         "grad_norm": optax.global_norm(grads),
         "param_norm": optax.global_norm(kernel_params),
-        "action_loss": log_dict["action_loss"],
-        "rep_loss": log_dict["rep_loss"],
+        # action_loss, rep_loss, and rep diagnostics (norms, temperature, layer-mix entropy,
+        # collision_rate) all flow through log_dict; each is meaned by the logging step.
+        **log_dict,
     }
     return new_state, info
 
@@ -254,11 +255,10 @@ def val_step(
         episode_id=episode_id,
         negative_observation=negative_observation,
     )
-    return {
-        "val/loss": jnp.mean(chunked_loss),
-        "val/action_loss": log_dict["action_loss"],
-        "val/rep_loss": log_dict["rep_loss"],
-    }
+    # Same keys as train (action_loss, rep_loss, rep diagnostics incl. per-split collision_rate),
+    # prefixed val/ and meaned. Comparing train vs val collision_rate surfaces the val-loader
+    # sampling asymmetry; the norm/temperature diagnostics confirm the normalization fix.
+    return {"val/loss": jnp.mean(chunked_loss), **{f"val/{k}": jnp.mean(v) for k, v in log_dict.items()}}
 
 
 def main(config: _config.TrainConfig):
