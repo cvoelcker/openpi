@@ -128,12 +128,26 @@ class Pi0RepConfig(Pi0Config):
     """Config for the CRL representation-learning variant of Pi0.
 
     Identical architecture to Pi0Config (pi05=True by default) but instantiates
-    pi05rep.Pi0, which adds phi/psi readout tokens for contrastive RL training.
+    pi05rep.Pi0, which adds dedicated phi/psi self-attention heads that pool a
+    learned mix over all backbone layers for contrastive RL training.
     """
 
     pi05: bool = True
     rep_dim: int = 512
     crl_loss_coeff: float = 0.01
+    # Weight on the flow-matching action loss. 1.0 = normal joint training; 0.0
+    # switches the action loss off entirely for pure representation learning. Note:
+    # with action_loss_coeff=0.0 AND rep_backbone_grad_scale=0.0 the backbone gets
+    # no gradient (heads train on a frozen backbone); raise rep_backbone_grad_scale
+    # to train the backbone from the rep loss alone.
+    action_loss_coeff: float = 1.0
+    # Number of gemma blocks in each (phi/psi) representation head. Per-config
+    # hyperparameter: raise for more head capacity, lower (e.g. 1) for leaner heads.
+    rep_head_depth: int = 2
+    # How much of the CRL representation loss gradient flows into the shared backbone.
+    # 0.0 => full stop_gradient (backbone shaped only by the action loss; the rep heads
+    # are read-only probes over a learned layer-mix). Values in (0, 1] scale the leak.
+    rep_backbone_grad_scale: float = 0.0
     # Input the phi (current-time CRL anchor) representation is trained on:
     # "state_action" — phi token lives on the action suffix and sees the noisy
     # action tokens (Q-value style, the default); "state" — phi token joins psi

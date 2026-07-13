@@ -191,7 +191,7 @@ def build_feature_fn(graphdef):
 
         # Pool over the real state tokens (images + language); drop the trailing
         # phi/psi rep tokens so we measure backbone content, not the rep readouts.
-        num_rep = model._num_prefix_rep_tokens
+        num_rep = 0  # rep tokens removed from the prefix in the head-based redesign
         valid = mask
         if num_rep > 0:
             valid = valid.at[:, mask.shape[1] - num_rep :].set(False)
