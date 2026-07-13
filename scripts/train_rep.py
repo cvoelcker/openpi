@@ -167,9 +167,16 @@ def train_step(
         future_observation: _model.Observation,
         actions: _model.Actions,
         episode_id: at.Int[at.Array, " b"] | None,
+        negative_observation: _model.Observation | None,
     ):
         chunked_loss, log_dict = model.compute_loss(
-            rng, observation, future_observation, actions, train=True, episode_id=episode_id
+            rng,
+            observation,
+            future_observation,
+            actions,
+            train=True,
+            episode_id=episode_id,
+            negative_observation=negative_observation,
         )
         return jnp.mean(chunked_loss), log_dict
 
@@ -178,11 +185,12 @@ def train_step(
     future_observation = batch["future_observation"]
     actions = batch["actions"]
     episode_id = batch.get("episode_id")
+    negative_observation = batch.get("negative_observation")
 
     # Filter out frozen params.
     diff_state = nnx.DiffState(0, config.trainable_filter)
     ((loss, log_dict), grads) = nnx.value_and_grad(loss_fn, argnums=diff_state, has_aux=True)(
-        model, train_rng, observation, future_observation, actions, episode_id
+        model, train_rng, observation, future_observation, actions, episode_id, negative_observation
     )
 
     params = state.params.filter(config.trainable_filter)
@@ -235,9 +243,16 @@ def val_step(
     future_observation = batch["future_observation"]
     actions = batch["actions"]
     episode_id = batch.get("episode_id")
+    negative_observation = batch.get("negative_observation")
 
     chunked_loss, log_dict = model.compute_loss(
-        rng, observation, future_observation, actions, train=False, episode_id=episode_id
+        rng,
+        observation,
+        future_observation,
+        actions,
+        train=False,
+        episode_id=episode_id,
+        negative_observation=negative_observation,
     )
     return {
         "val/loss": jnp.mean(chunked_loss),

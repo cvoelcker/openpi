@@ -112,6 +112,9 @@ class DataConfig:
     include_next_observation: bool = True
     include_future_observation: bool = True
     include_goal_observation: bool = True
+    # When True, the goal-conditioned loader also samples an explicit within-task negative per
+    # anchor (uniform over frames sharing the anchor's task) as a hard CRL contrastive negative.
+    include_negative_observation: bool = False
 
 
 class GroupFactory(Protocol):
@@ -1188,7 +1191,7 @@ _CONFIGS = [
         ).get_freeze_filter(),
         data=LeRobotLiberoDataConfig(
             repo_id="physical-intelligence/libero",
-            base_config=DataConfig(prompt_from_task=True),
+            base_config=DataConfig(prompt_from_task=True, include_negative_observation=True),
             extra_delta_transform=False,
         ),
         batch_size=256,

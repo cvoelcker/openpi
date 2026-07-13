@@ -50,12 +50,15 @@ class GoalConditionedBatch(TypedDict, total=False):
     next_observation: _model.Observation
     future_observation: _model.Observation
     goal_observation: _model.Observation
+    # Explicit within-task negative: a frame sampled uniformly from any episode of the anchor's
+    # task (possibly its own trajectory — deliberately unbiased). Serves as a hard negative
+    # candidate future in the CRL contrast.
+    negative_observation: _model.Observation
     actions: at.Float[at.Array, "*b ah ad"]
     next_is_pad: at.Array
     future_is_pad: at.Array
     goal_is_pad: at.Array
-    # Per-sample episode identifier (the anchor frame's episode). Used to mask
-    # same-episode entries out of the in-batch contrastive negatives.
+    # Per-sample episode identifier (the anchor frame's episode).
     episode_id: at.Array
 
 logger = logging.getLogger(__name__)
@@ -69,9 +72,11 @@ class GoalSamplingConfig:
     # geometric distribution with p = 1 - gamma, then clamped to the episode end.
     # gamma -> 0 picks near goals (mostly t+1); gamma -> 1 picks far goals (often episode end).
     gamma: float = 0.99
-    # If True, the future index is sampled uniformly in (t, g]. If False, it uses the same
-    # truncated-geometric scheme as the goal (restricted to (t, g]).
-    future_uniform: bool = True
+    # Geometric discount for the CRL *positive* future. The future offset is drawn directly
+    # from a geometric truncated (renormalized) to the remaining episode -- decoupled from the
+    # goal, so the positive's marginal is a true geometric (LIBERO episodes are short, so 0.95
+    # spreads the positive across the episode without piling mass at the boundary).
+    future_gamma: float = 0.95
     # Base RNG seed. Combined with the worker id so each data-loader worker is independent.
     seed: int = 0
 
@@ -87,6 +92,24 @@ def _per_frame_episode_bounds(dataset: lerobot_dataset.LeRobotDataset) -> tuple[
         ep_start[start:end] = start
         ep_end[start:end] = end
     return ep_start, ep_end
+
+
+def _per_frame_task_index(dataset: lerobot_dataset.LeRobotDataset) -> np.ndarray:
+    """Read the per-frame ``task_index`` column (metadata only, no image decode)."""
+    hf = dataset.hf_dataset
+    try:
+        # Arrow column access never touches the (lazily-decoded) image columns.
+        return np.asarray(hf.data.column("task_index").to_numpy(zero_copy_only=False)).astype(np.int64)
+    except Exception:  # noqa: BLE001 -- fall back to the datasets column accessor
+        return np.asarray(hf["task_index"]).astype(np.int64)
+
+
+def _build_task_to_frames(frame_task: np.ndarray, frames: np.ndarray | None = None) -> dict[int, np.ndarray]:
+    """Map each task_index to the frame indices belonging to it. Built once at init. When
+    ``frames`` is given, restrict to that subset (used to keep train/val negatives within-split)."""
+    frames = np.arange(len(frame_task)) if frames is None else np.asarray(frames)
+    tasks = frame_task[frames]
+    return {int(task): frames[tasks == task] for task in np.unique(tasks)}
 
 
 class RandomFutureDataset(_data_loader.Dataset):
@@ -107,6 +130,9 @@ class RandomFutureDataset(_data_loader.Dataset):
         include_next_observation: bool = True,
         include_future_observation: bool = True,
         include_goal_observation: bool = True,
+        include_negative_observation: bool = False,
+        frame_task: np.ndarray | None = None,
+        task_to_frames: dict[int, np.ndarray] | None = None,
     ):
         self._dataset = transformed_dataset
         self._ep_start = ep_start
@@ -116,6 +142,11 @@ class RandomFutureDataset(_data_loader.Dataset):
         self._include_next = include_next_observation
         self._include_future = include_future_observation
         self._include_goal = include_goal_observation
+        self._include_negative = include_negative_observation
+        if include_negative_observation and (frame_task is None or task_to_frames is None):
+            raise ValueError("include_negative_observation=True requires frame_task and task_to_frames.")
+        self._frame_task = frame_task
+        self._task_to_frames = task_to_frames
         self._gen: np.random.Generator | None = None
 
     def __len__(self) -> int:
@@ -130,10 +161,25 @@ class RandomFutureDataset(_data_loader.Dataset):
         return self._gen
 
     def _sample_goal_offset_chunks(self, max_chunks: int, rng: np.random.Generator) -> int:
-        """Sample a goal offset in [1, max_chunks] chunks from a truncated geometric distribution."""
+        """Sample a goal offset in [1, max_chunks] chunks from a (clamped) geometric distribution."""
         p = max(1e-6, 1.0 - self._sampling.gamma)
         d = int(rng.geometric(p))
         return min(max(d, 1), max_chunks)
+
+    @staticmethod
+    def _sample_truncated_geometric(max_chunks: int, gamma: float, rng: np.random.Generator) -> int:
+        """Sample an offset in [1, max_chunks] from a geometric *truncated* (renormalized) to that
+        range: P(d) ∝ (1 - gamma) * gamma**(d - 1). Unlike clamping, this does not pile the tail
+        mass on the boundary offset -- it renormalizes over [1, max_chunks] via the inverse CDF.
+        gamma -> 0 favors near offsets; gamma -> 1 approaches uniform over the range."""
+        if max_chunks <= 1:
+            return 1
+        g = min(max(gamma, 1e-6), 1.0 - 1e-6)
+        # F(k) = (1 - g**k) / (1 - g**max_chunks); solve for the smallest k with F(k) >= u.
+        cdf_max = 1.0 - g**max_chunks
+        u = rng.random()
+        k = int(np.ceil(np.log1p(-u * cdf_max) / np.log(g)))
+        return min(max(k, 1), max_chunks)
 
     def _sample_indices(self, t: int) -> tuple[int, int, int, dict[str, np.bool_]]:
         ep_end = int(self._ep_end[t])
@@ -158,10 +204,9 @@ class RandomFutureDataset(_data_loader.Dataset):
         goal_offset_chunks = self._sample_goal_offset_chunks(num_chunks, rng)
         goal_idx = t + goal_offset_chunks * C
 
-        if self._sampling.future_uniform:
-            future_offset_chunks = int(rng.integers(1, goal_offset_chunks + 1))
-        else:
-            future_offset_chunks = self._sample_goal_offset_chunks(goal_offset_chunks, rng)
+        # CRL positive: geometric future over the whole remaining episode, decoupled from the
+        # goal so its marginal is a true (truncated) geometric rather than a goal-conditioned mix.
+        future_offset_chunks = self._sample_truncated_geometric(num_chunks, self._sampling.future_gamma, rng)
         future_idx = t + future_offset_chunks * C
 
         pads = {
@@ -182,7 +227,7 @@ class RandomFutureDataset(_data_loader.Dataset):
             return {k: v for k, v in sample.items() if k != "actions"}
 
         # The episode-start frame index uniquely identifies the anchor's episode; equal
-        # values mean same episode. Used downstream to mask same-episode contrastive negatives.
+        # values mean same episode.
         item = {"observation": _obs_only(anchor), "episode_id": np.int64(self._ep_start[t])}
         if self._include_next:
             item["next_observation"] = _obs_only(self._dataset[next_idx])
@@ -193,6 +238,12 @@ class RandomFutureDataset(_data_loader.Dataset):
         if self._include_goal:
             item["goal_observation"] = _obs_only(self._dataset[goal_idx])
             item["goal_is_pad"] = pads["goal_is_pad"]
+        if self._include_negative:
+            # Explicit within-task negative: uniform over all frames sharing the anchor's task,
+            # deliberately unbiased (may land on the anchor's own trajectory).
+            same_task_frames = self._task_to_frames[int(self._frame_task[t])]
+            neg_idx = int(same_task_frames[self._rng().integers(0, len(same_task_frames))])
+            item["negative_observation"] = _obs_only(self._dataset[neg_idx])
         if actions is not None:
             item["actions"] = actions
         return item
@@ -211,7 +262,7 @@ class GoalConditionedDataLoader(_data_loader.DataLoader):
     def __iter__(self) -> Iterator[dict]:
         for batch in self._data_loader:
             out = {"observation": _model.Observation.from_dict(batch["observation"])}
-            for key in ("next_observation", "future_observation", "goal_observation"):
+            for key in ("next_observation", "future_observation", "goal_observation", "negative_observation"):
                 if key in batch:
                     out[key] = _model.Observation.from_dict(batch[key])
             for key in ("next_is_pad", "future_is_pad", "goal_is_pad", "episode_id"):
@@ -351,6 +402,10 @@ def create_goal_conditioned_data_loader(
     transformed = _data_loader.transform_dataset(base_dataset, data_config, skip_norm_stats=skip_norm_stats)
 
     ep_start, ep_end = _per_frame_episode_bounds(raw_dataset)
+    frame_task, task_to_frames = (None, None)
+    if data_config.include_negative_observation:
+        frame_task = _per_frame_task_index(raw_dataset)
+        task_to_frames = _build_task_to_frames(frame_task)
     dataset = RandomFutureDataset(
         transformed,
         ep_start,
@@ -360,6 +415,9 @@ def create_goal_conditioned_data_loader(
         include_next_observation=data_config.include_next_observation,
         include_future_observation=data_config.include_future_observation,
         include_goal_observation=data_config.include_goal_observation,
+        include_negative_observation=data_config.include_negative_observation,
+        frame_task=frame_task,
+        task_to_frames=task_to_frames,
     )
 
     local_batch_size = config.batch_size // jax.process_count()
@@ -432,13 +490,24 @@ def create_train_val_goal_conditioned_data_loaders(
     ep_start, ep_end = _per_frame_episode_bounds(raw_dataset)
     train_indices, val_indices = _data_loader._split_episode_indices(raw_dataset, config.val_fraction, config.seed)
 
+    frame_task = _per_frame_task_index(raw_dataset) if data_config.include_negative_observation else None
+
     def _make_loader(indices, shuffle):
+        # Restrict negatives to the anchor's own split so the val negative marginal stays clean.
+        split_task_to_frames = (
+            _build_task_to_frames(frame_task, np.asarray(indices))
+            if data_config.include_negative_observation
+            else None
+        )
         dataset = RandomFutureDataset(
             transformed, ep_start, ep_end,
             sampling=sampling, action_chunk_size=action_horizon,
             include_next_observation=data_config.include_next_observation,
             include_future_observation=data_config.include_future_observation,
             include_goal_observation=data_config.include_goal_observation,
+            include_negative_observation=data_config.include_negative_observation,
+            frame_task=frame_task,
+            task_to_frames=split_task_to_frames,
         )
         local_batch_size = config.batch_size // jax.process_count()
         sampler = torch.utils.data.SubsetRandomSampler(indices.tolist())

@@ -158,9 +158,7 @@ class Pi0(_model.BaseModel):
         phi_mem_width = paligemma_config.width if self._phi_on_prefix else action_expert_config.width
 
         def _head_config(width):
-            return dataclasses.replace(
-                paligemma_config, width=width, depth=config.rep_head_depth, lora_configs={}
-            )
+            return dataclasses.replace(paligemma_config, width=width, depth=config.rep_head_depth, lora_configs={})
 
         psi_head = nnx_bridge.ToNNX(_RepHead(_head_config(psi_mem_width), config.dtype))
         psi_head.lazy_init(jnp.zeros((1, 2, psi_mem_width)), jnp.ones((1, 2), dtype=bool), rngs=rngs)
@@ -378,14 +376,19 @@ class Pi0(_model.BaseModel):
                 "get_phi_representation requires phi_input='state_action' (suffix phi); "
                 "with phi_input='state' use get_state_representations and compute_velocity_step."
             )
-        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, noisy_actions, timestep)
+        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
+            observation, noisy_actions, timestep
+        )
         suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
         prefix_attn_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
         full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
         positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
         (_, suffix_out), _, (_, suffix_hidden) = self.PaliGemma.llm(
-            [None, suffix_tokens], mask=full_attn_mask, positions=positions,
-            kv_cache=kv_cache, adarms_cond=[None, adarms_cond],
+            [None, suffix_tokens],
+            mask=full_attn_mask,
+            positions=positions,
+            kv_cache=kv_cache,
+            adarms_cond=[None, adarms_cond],
         )
         phi_rep = self._phi_from_suffix(suffix_hidden, suffix_mask)
         action_hidden = suffix_out[:, -self.action_horizon :]
@@ -424,18 +427,28 @@ class Pi0(_model.BaseModel):
         *,
         train: bool = False,
         episode_id: at.Int[at.Array, " b"] | None = None,
+        negative_observation: _model.Observation | None = None,
     ) -> at.Float[at.Array, "*b ah"]:
-        preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
+        preprocess_rng, future_preprocess_rng, negative_preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 5)
+        # Augment each contrastive view independently — a shared key would apply the
+        # identical crop/rotation/jitter to each anchor/future pair, letting the model match
+        # on shared appearance artifacts instead of learning temporal state progress.
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
-        future_observation = _model.preprocess_observation(preprocess_rng, future_observation, train=train)
+        future_observation = _model.preprocess_observation(future_preprocess_rng, future_observation, train=train)
 
-        # Concatenate current + future for a single forward pass.
-        # Actions are duplicated for the future half — that portion of the suffix is discarded
-        # so the duplicated actions never enter the action loss.
+        # Stack current + future (+ optional explicit within-task negative) for one forward pass.
+        # Actions are duplicated for the future/negative halves — those suffixes are discarded, so
+        # the duplicated actions never enter the action loss.
+        obs_group = [observation, future_observation]
+        if negative_observation is not None:
+            negative_observation = _model.preprocess_observation(
+                negative_preprocess_rng, negative_observation, train=train
+            )
+            obs_group.append(negative_observation)
         observation_stacked = jax.tree_util.tree_map(
-            lambda x, y: jnp.concatenate([x, y], axis=0), observation, future_observation
+            lambda *xs: jnp.concatenate(xs, axis=0), *obs_group
         )
-        actions_stacked = jnp.concatenate([actions, actions], axis=0)
+        actions_stacked = jnp.concatenate([actions] * len(obs_group), axis=0)
 
         orig_batch_size = actions.shape[0]
         noise = jax.random.normal(noise_rng, actions_stacked.shape)
@@ -458,35 +471,36 @@ class Pi0(_model.BaseModel):
         v_t = self.action_out_proj(suffix_out[:orig_batch_size, -self.action_horizon :])
         action_loss = jnp.mean(jnp.square(v_t - u_t[:orig_batch_size]), axis=-1)
 
-        # CRL reps via dedicated heads over a learned layer-mix. psi always from the
-        # future prefix; phi from the current prefix (state mode) or current suffix
-        # (state_action mode). Layer axis is 0, so slice batch on axis 1.
-        psi = self._psi_from_prefix(prefix_hidden[:, orig_batch_size:], prefix_mask[orig_batch_size:])
+        # CRL reps via dedicated heads over a learned layer-mix. psi always reads a prefix
+        # (state-only); phi reads the current prefix (state mode) or current suffix
+        # (state_action mode). Layer axis is 0, so slice batch on axis 1. The stack is
+        # [current | future | (negative)], so slices are [:B], [B:2B], [2B:3B].
+        B = orig_batch_size
+        psi_flat = self._psi_from_prefix(prefix_hidden[:, B : 2 * B], prefix_mask[B : 2 * B])  # (B, d)
         if self._phi_on_prefix:
-            phi = self._phi_from_prefix(prefix_hidden[:, :orig_batch_size], prefix_mask[:orig_batch_size])
+            phi_flat = self._phi_from_prefix(prefix_hidden[:, :B], prefix_mask[:B])  # (B, d)
         else:
-            phi = self._phi_from_suffix(suffix_hidden[:, :orig_batch_size], suffix_mask[:orig_batch_size])
-        phi = jnp.expand_dims(phi, axis=0)  # (1, B, rep_dim)
-        psi = jnp.expand_dims(psi, axis=1)  # (B, 1, rep_dim)
+            phi_flat = self._phi_from_suffix(suffix_hidden[:, :B], suffix_mask[:B])  # (B, d)
 
-        crl_matrix = jnp.sum(phi * psi, axis=-1)   # (B, B): [i, j] = <psi_i, phi_j>
-
-        # Mask same-episode off-diagonal pairs. future_i shares anchor i's episode, so
-        # entry [i, j] is a same-episode pair iff episode_id[i] == episode_id[j]. Those
-        # off-diagonal entries are false negatives (temporally-close, near-duplicate
-        # frames) that would otherwise be contrasted against the positive and inflate the
-        # loss. Setting them very negative removes them from both logsumexp reductions;
-        # the diagonal (the true positive) is always kept.
-        if episode_id is not None:
-            same_ep = episode_id[:, None] == episode_id[None, :]  # (B, B)
-            false_neg = same_ep & ~jnp.eye(orig_batch_size, dtype=bool)
-            crl_matrix = jnp.where(false_neg, -2.3819763e38, crl_matrix)
-
+        crl_matrix = jnp.einsum("id,jd->ij", psi_flat, phi_flat)  # (B, B): [i, j] = <psi_i, phi_j>
         crl_pos = jnp.diag(crl_matrix)
 
-        # Symmetric InfoNCE: contrast over current states (axis=1) AND over futures (axis=0).
-        crl_neg_over_phi = jax.nn.logsumexp(crl_matrix, axis=1)   # anchor psi_i, normalize over phi
-        crl_neg_over_psi = jax.nn.logsumexp(crl_matrix, axis=0)   # anchor phi_j, normalize over psi
+        # Explicit within-task negative: an extra candidate future (psi-type) for its own anchor.
+        # It enters only the anchor->future direction (normalize over psi), as an extra key per
+        # anchor column j; a negative goal is not the positive of any anchor, so it has no query
+        # role in the future->anchor direction. Mixing this within-task hard negative with the
+        # (mostly cross-task) in-batch negatives keeps the InfoNCE denominator a valid mixture
+        # reference while forcing phi/psi to discriminate states *within* a task.
+        if negative_observation is not None:
+            psi_neg = self._psi_from_prefix(prefix_hidden[:, 2 * B : 3 * B], prefix_mask[2 * B : 3 * B])  # (B, d)
+            crl_self_neg = jnp.sum(phi_flat * psi_neg, axis=-1)  # (B,): [j] = <phi_j, psi_neg_j>
+            over_psi_logits = jnp.concatenate([crl_matrix, crl_self_neg[None, :]], axis=0)  # (B+1, B)
+        else:
+            over_psi_logits = crl_matrix
+
+        # Symmetric InfoNCE: contrast over anchors (axis=1) AND over futures (axis=0).
+        crl_neg_over_phi = jax.nn.logsumexp(crl_matrix, axis=1)  # future psi_i, normalize over phi anchors
+        crl_neg_over_psi = jax.nn.logsumexp(over_psi_logits, axis=0)  # anchor phi_j, normalize over psi (+ its neg)
         crl_loss = 0.5 * jnp.mean((crl_neg_over_phi - crl_pos) + (crl_neg_over_psi - crl_pos))
 
         # Logsumexp penalty (prevents logit blow-up / collapse; JaxGCRL uses coeff 0.1).
