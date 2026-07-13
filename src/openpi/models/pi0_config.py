@@ -158,6 +158,19 @@ class Pi0RepConfig(Pi0Config):
     # time CRL target) is always state-input by design. The two rep tokens
     # never attend to each other.
     phi_input: str = "state_action"
+    # Dropout applied inside the phi/psi rep heads (on the pooled query vector) during
+    # training only. 0.0 = off (previous behavior). A regularizer for the small trainable
+    # head set over a frozen backbone; helps close the train<<val rep-loss gap.
+    rep_head_dropout: float = 0.0
+    # CRL reps are L2-normalized before the InfoNCE dot products, so logits are cosine
+    # similarities in [-1, 1]. A learnable temperature (initialized to this value, CLIP-style)
+    # restores separability; without it normalized logits can't sharpen. Stored as a learnable
+    # logit_scale = log(1/temperature); clamped at exp <= 100 to avoid runaway.
+    crl_temperature_init: float = 0.07
+    # Coefficient on the logsumexp penalty (guards against logit blow-up / collapse). With
+    # L2-norm + temperature the logit scale is already bounded, so this defaults lower than the
+    # old hardcoded 0.1. Set to 0.0 to disable.
+    logsumexp_penalty_coeff: float = 0.01
 
     def __post_init__(self):
         super().__post_init__()
@@ -184,7 +197,9 @@ class Pi0RepConfig(Pi0Config):
         # the backbone from the trainable set, so its backward pass and optimizer
         # state are never materialized — a large speed and memory win.
         if self.backbone_frozen:
-            rep_head_filter = nnx_utils.PathRegex(r".*(phi|psi)_(head|mix|proj).*")
+            # Rep-head params: phi/psi head blocks, layer-mix logits, output projections,
+            # plus the learnable CRL temperature (logit_scale).
+            rep_head_filter = nnx_utils.PathRegex(r".*((phi|psi)_(head|mix|proj)|logit_scale).*")
             return nnx.Not(rep_head_filter)
         return super().get_freeze_filter()
 

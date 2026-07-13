@@ -68,15 +68,26 @@ def posemb_sincos(
     return jnp.concatenate([jnp.sin(sinusoid_input), jnp.cos(sinusoid_input)], axis=-1)
 
 
+def _feature_dropout(x, rate: float, *, deterministic: bool, rng):
+    """Inverted dropout with an explicitly-passed jax key (avoids the flax rng-collection
+    machinery, which does not thread cleanly through the nnx bridge). No-op unless training."""
+    if rate <= 0.0 or deterministic or rng is None:
+        return x
+    keep = 1.0 - rate
+    mask = jax.random.bernoulli(rng, keep, x.shape)
+    return jnp.where(mask, x / keep, 0.0)
+
+
 class _RepHead(nn.Module):
     """Attention-pooling head: reuses gemma Blocks to pool a layer-mixed backbone
     token sequence into a single vector via a learned query token."""
 
     config: _gemma.Config
     embed_dtype: str
+    dropout: float = 0.0
 
     @nn.compact
-    def __call__(self, memory, memory_mask):
+    def __call__(self, memory, memory_mask, *, deterministic: bool = True, dropout_rng=None):
         # memory: (b, t, d); memory_mask: (b, t) bool
         memory = memory.astype(self.embed_dtype)
         b, t, d = memory.shape
@@ -92,7 +103,8 @@ class _RepHead(nn.Module):
                 [seq], None, positions, attn_mask, [None]
             )
         seq, _ = _gemma.RMSNorm(name="final_norm")(seq, None)
-        return seq[:, -1]  # (b, d) — the pooled query row
+        pooled = seq[:, -1]  # (b, d) — the pooled query row
+        return _feature_dropout(pooled, self.dropout, deterministic=deterministic, rng=dropout_rng)
 
 
 class Pi0(_model.BaseModel):
@@ -160,9 +172,10 @@ class Pi0(_model.BaseModel):
         def _head_config(width):
             return dataclasses.replace(paligemma_config, width=width, depth=config.rep_head_depth, lora_configs={})
 
-        psi_head = nnx_bridge.ToNNX(_RepHead(_head_config(psi_mem_width), config.dtype))
+        self.rep_head_dropout = config.rep_head_dropout
+        psi_head = nnx_bridge.ToNNX(_RepHead(_head_config(psi_mem_width), config.dtype, dropout=config.rep_head_dropout))
         psi_head.lazy_init(jnp.zeros((1, 2, psi_mem_width)), jnp.ones((1, 2), dtype=bool), rngs=rngs)
-        phi_head = nnx_bridge.ToNNX(_RepHead(_head_config(phi_mem_width), config.dtype))
+        phi_head = nnx_bridge.ToNNX(_RepHead(_head_config(phi_mem_width), config.dtype, dropout=config.rep_head_dropout))
         phi_head.lazy_init(jnp.zeros((1, 2, phi_mem_width)), jnp.ones((1, 2), dtype=bool), rngs=rngs)
         self.psi_head = psi_head
         self.phi_head = phi_head
@@ -173,6 +186,12 @@ class Pi0(_model.BaseModel):
 
         self.phi_proj = nnx.Linear(phi_mem_width, config.rep_dim, rngs=rngs)
         self.psi_proj = nnx.Linear(psi_mem_width, config.rep_dim, rngs=rngs)
+
+        # Learnable CRL temperature. Reps are L2-normalized before the InfoNCE dot products,
+        # so logits are cosine sims; logit_scale = log(1/temperature) rescales them (CLIP-style),
+        # clamped at exp(logit_scale) <= 100 to avoid runaway. Named to match the freeze filter.
+        self.logit_scale = nnx.Param(jnp.asarray(jnp.log(1.0 / config.crl_temperature_init), dtype=jnp.float32))
+        self.logsumexp_penalty_coeff = config.logsumexp_penalty_coeff
 
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
@@ -192,17 +211,17 @@ class Pi0(_model.BaseModel):
         weights = jax.nn.softmax(mix_logits.astype(jnp.float32))
         return jnp.einsum("l,lbtd->btd", weights, hidden.astype(jnp.float32))
 
-    def _psi_from_prefix(self, prefix_hidden, prefix_mask):
+    def _psi_from_prefix(self, prefix_hidden, prefix_mask, *, deterministic=True, dropout_rng=None):
         mem = self._mix_layers(prefix_hidden, self.psi_mix.value, self.rep_backbone_grad_scale)
-        return self.psi_proj(self.psi_head(mem, prefix_mask))
+        return self.psi_proj(self.psi_head(mem, prefix_mask, deterministic=deterministic, dropout_rng=dropout_rng))
 
-    def _phi_from_prefix(self, prefix_hidden, prefix_mask):
+    def _phi_from_prefix(self, prefix_hidden, prefix_mask, *, deterministic=True, dropout_rng=None):
         mem = self._mix_layers(prefix_hidden, self.phi_mix.value, self.rep_backbone_grad_scale)
-        return self.phi_proj(self.phi_head(mem, prefix_mask))
+        return self.phi_proj(self.phi_head(mem, prefix_mask, deterministic=deterministic, dropout_rng=dropout_rng))
 
-    def _phi_from_suffix(self, suffix_hidden, suffix_mask):
+    def _phi_from_suffix(self, suffix_hidden, suffix_mask, *, deterministic=True, dropout_rng=None):
         mem = self._mix_layers(suffix_hidden, self.phi_mix.value, self.rep_backbone_grad_scale)
-        return self.phi_proj(self.phi_head(mem, suffix_mask))
+        return self.phi_proj(self.phi_head(mem, suffix_mask, deterministic=deterministic, dropout_rng=dropout_rng))
 
     def _run_prefix(self, observation):
         """Prefix-only backbone pass. Returns (prefix_out, prefix_hidden, kv_cache, prefix_mask, prefix_len)."""
@@ -429,7 +448,12 @@ class Pi0(_model.BaseModel):
         episode_id: at.Int[at.Array, " b"] | None = None,
         negative_observation: _model.Observation | None = None,
     ) -> at.Float[at.Array, "*b ah"]:
-        preprocess_rng, future_preprocess_rng, negative_preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 5)
+        preprocess_rng, future_preprocess_rng, negative_preprocess_rng, noise_rng, time_rng, dropout_rng = (
+            jax.random.split(rng, 6)
+        )
+        # Independent head-dropout keys per rep (only used when train=True).
+        phi_drop_rng, psi_drop_rng, neg_drop_rng = jax.random.split(dropout_rng, 3)
+        deterministic = not train
         # Augment each contrastive view independently — a shared key would apply the
         # identical crop/rotation/jitter to each anchor/future pair, letting the model match
         # on shared appearance artifacts instead of learning temporal state progress.
@@ -476,13 +500,28 @@ class Pi0(_model.BaseModel):
         # (state_action mode). Layer axis is 0, so slice batch on axis 1. The stack is
         # [current | future | (negative)], so slices are [:B], [B:2B], [2B:3B].
         B = orig_batch_size
-        psi_flat = self._psi_from_prefix(prefix_hidden[:, B : 2 * B], prefix_mask[B : 2 * B])  # (B, d)
+        psi_raw = self._psi_from_prefix(
+            prefix_hidden[:, B : 2 * B], prefix_mask[B : 2 * B], deterministic=deterministic, dropout_rng=psi_drop_rng
+        )  # (B, d)
         if self._phi_on_prefix:
-            phi_flat = self._phi_from_prefix(prefix_hidden[:, :B], prefix_mask[:B])  # (B, d)
+            phi_raw = self._phi_from_prefix(
+                prefix_hidden[:, :B], prefix_mask[:B], deterministic=deterministic, dropout_rng=phi_drop_rng
+            )  # (B, d)
         else:
-            phi_flat = self._phi_from_suffix(suffix_hidden[:, :B], suffix_mask[:B])  # (B, d)
+            phi_raw = self._phi_from_suffix(
+                suffix_hidden[:, :B], suffix_mask[:B], deterministic=deterministic, dropout_rng=phi_drop_rng
+            )  # (B, d)
 
-        crl_matrix = jnp.einsum("id,jd->ij", psi_flat, phi_flat)  # (B, B): [i, j] = <psi_i, phi_j>
+        # L2-normalize reps onto the unit sphere so InfoNCE logits are cosine similarities.
+        # This removes the norm-inflation shortcut (driving train loss down by growing ||rep||
+        # rather than improving alignment) and forces the heads to separate directions.
+        eps = 1e-6
+        phi_flat = phi_raw / (jnp.linalg.norm(phi_raw, axis=-1, keepdims=True) + eps)
+        psi_flat = psi_raw / (jnp.linalg.norm(psi_raw, axis=-1, keepdims=True) + eps)
+        # Learnable temperature (clamped) restores separability of the bounded cosine logits.
+        logit_scale = jnp.exp(jnp.minimum(self.logit_scale.value, jnp.log(100.0)))
+
+        crl_matrix = logit_scale * jnp.einsum("id,jd->ij", psi_flat, phi_flat)  # (B, B): [i, j] = <psi_i, phi_j>
         crl_pos = jnp.diag(crl_matrix)
 
         # Explicit within-task negative: an extra candidate future (psi-type) for its own anchor.
@@ -492,8 +531,14 @@ class Pi0(_model.BaseModel):
         # (mostly cross-task) in-batch negatives keeps the InfoNCE denominator a valid mixture
         # reference while forcing phi/psi to discriminate states *within* a task.
         if negative_observation is not None:
-            psi_neg = self._psi_from_prefix(prefix_hidden[:, 2 * B : 3 * B], prefix_mask[2 * B : 3 * B])  # (B, d)
-            crl_self_neg = jnp.sum(phi_flat * psi_neg, axis=-1)  # (B,): [j] = <phi_j, psi_neg_j>
+            psi_neg_raw = self._psi_from_prefix(
+                prefix_hidden[:, 2 * B : 3 * B],
+                prefix_mask[2 * B : 3 * B],
+                deterministic=deterministic,
+                dropout_rng=neg_drop_rng,
+            )  # (B, d)
+            psi_neg = psi_neg_raw / (jnp.linalg.norm(psi_neg_raw, axis=-1, keepdims=True) + eps)
+            crl_self_neg = logit_scale * jnp.sum(phi_flat * psi_neg, axis=-1)  # (B,): [j] = <phi_j, psi_neg_j>
             over_psi_logits = jnp.concatenate([crl_matrix, crl_self_neg[None, :]], axis=0)  # (B+1, B)
         else:
             over_psi_logits = crl_matrix
@@ -503,12 +548,32 @@ class Pi0(_model.BaseModel):
         crl_neg_over_psi = jax.nn.logsumexp(over_psi_logits, axis=0)  # anchor phi_j, normalize over psi (+ its neg)
         crl_loss = 0.5 * jnp.mean((crl_neg_over_phi - crl_pos) + (crl_neg_over_psi - crl_pos))
 
-        # Logsumexp penalty (prevents logit blow-up / collapse; JaxGCRL uses coeff 0.1).
+        # Logsumexp penalty (guards against logit blow-up / collapse); coeff is a config knob.
         logsumexp_penalty = 0.5 * (jnp.mean(crl_neg_over_phi**2) + jnp.mean(crl_neg_over_psi**2))
-        crl_loss = crl_loss + 0.1 * logsumexp_penalty
+        crl_loss = crl_loss + self.logsumexp_penalty_coeff * logsumexp_penalty
+
+        # Diagnostics (meaned by the train loop). Pre-normalization rep norms confirm whether the
+        # heads were inflating norms; layer-mix entropy watches for mix collapse; collision_rate is
+        # the fraction of off-diagonal in-batch pairs sharing an episode (false-negative pressure).
+        phi_mix_w = jax.nn.softmax(self.phi_mix.value.astype(jnp.float32))
+        psi_mix_w = jax.nn.softmax(self.psi_mix.value.astype(jnp.float32))
+        diagnostics = {
+            "phi_norm": jnp.mean(jnp.linalg.norm(phi_raw, axis=-1)),
+            "psi_norm": jnp.mean(jnp.linalg.norm(psi_raw, axis=-1)),
+            "temperature": 1.0 / logit_scale,
+            "phi_mix_entropy": -jnp.sum(phi_mix_w * jnp.log(phi_mix_w + eps)),
+            "psi_mix_entropy": -jnp.sum(psi_mix_w * jnp.log(psi_mix_w + eps)),
+            "phi_mix_max": jnp.max(phi_mix_w),
+            "psi_mix_max": jnp.max(psi_mix_w),
+        }
+        if episode_id is not None:
+            same_ep = episode_id[:, None] == episode_id[None, :]  # (B, B)
+            off_diag = ~jnp.eye(B, dtype=jnp.bool_)
+            n_off = jnp.sum(off_diag)
+            diagnostics["collision_rate"] = jnp.sum(same_ep & off_diag) / jnp.maximum(n_off, 1)
 
         total_loss = self.action_loss_coeff * action_loss + self.crl_loss_coeff * crl_loss
-        return total_loss, {"action_loss": action_loss, "rep_loss": crl_loss}
+        return total_loss, {"action_loss": action_loss, "rep_loss": crl_loss, **diagnostics}
 
     @override
     def sample_actions(

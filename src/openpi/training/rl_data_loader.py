@@ -492,7 +492,7 @@ def create_train_val_goal_conditioned_data_loaders(
 
     frame_task = _per_frame_task_index(raw_dataset) if data_config.include_negative_observation else None
 
-    def _make_loader(indices, shuffle):
+    def _make_loader(indices):
         # Restrict negatives to the anchor's own split so the val negative marginal stays clean.
         split_task_to_frames = (
             _build_task_to_frames(frame_task, np.asarray(indices))
@@ -511,15 +511,20 @@ def create_train_val_goal_conditioned_data_loaders(
         )
         local_batch_size = config.batch_size // jax.process_count()
         sampler = torch.utils.data.SubsetRandomSampler(indices.tolist())
+        # Use the same worker count for train and val. With per-worker RNG seeding
+        # (`_rng` = default_rng([seed, worker_id])), a val loader pinned to num_workers=0 would
+        # draw all its futures/goals/negatives from a single persistent stream — lower sampling
+        # diversity than train's N streams, which biases the train/val rep-loss comparison
+        # independent of true generalization. Matching worker counts removes that confound.
         torch_loader = _data_loader.TorchDataLoader(
             dataset, local_batch_size=local_batch_size,
             sharding=sharding, sampler=sampler,
-            num_workers=config.num_workers if shuffle else 0,
+            num_workers=config.num_workers,
             seed=config.seed,
         )
         return GoalConditionedDataLoader(data_config, torch_loader)
 
-    return _make_loader(train_indices, True), _make_loader(val_indices, False)
+    return _make_loader(train_indices), _make_loader(val_indices)
 
 
 def _create_goal_conditioned_rlds_data_loader(

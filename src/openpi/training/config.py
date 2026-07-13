@@ -1180,7 +1180,12 @@ _CONFIGS = [
             rep_dim=2048,
             action_loss_coeff=0.0,
             rep_backbone_grad_scale=0.0,
+            # Regularizers to close the train<<val rep-loss gap: dropout in the phi/psi heads,
+            # plus L2-norm + learnable temperature on the reps (on by default in Pi0RepConfig).
+            rep_head_dropout=0.1,
         ),
+        # rep_head_dropout / temperature / logsumexp_penalty_coeff do not affect backbone_frozen
+        # or the freeze regex, so the freeze_filter mirror below intentionally omits them.
         freeze_filter=pi0_config.Pi0RepConfig(
             pi05=True,
             action_horizon=10,
