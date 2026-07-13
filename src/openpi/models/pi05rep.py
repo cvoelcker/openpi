@@ -288,13 +288,13 @@ class Pi0(_model.BaseModel):
         )
         return suffix_out
 
-    def get_backward_representation(
+    def get_psi_representation(
         self, observation: _model.Observation
     ) -> tuple[at.Float[at.Array, "b emb"], "KVCache", at.Bool[at.Array, "b s"], int]:
-        """Compute the action-independent (backward) representation.
+        """Compute the action-independent (psi) representation.
 
-        Returns (backward_rep, kv_cache, prefix_mask, prefix_len) where
-        backward_rep is the psi_token output (last prefix token, or
+        Returns (psi_rep, kv_cache, prefix_mask, prefix_len) where
+        psi_rep is the psi_token output (last prefix token, or
         second-to-last when phi_input="state", where phi is the last one).
         """
         observation = _model.preprocess_observation(None, observation, train=False)
@@ -304,17 +304,17 @@ class Pi0(_model.BaseModel):
         (prefix_out, _), kv_cache = self.PaliGemma.llm(
             [prefix_tokens, None], mask=prefix_attn_mask, positions=positions
         )
-        backward_rep = self.psi_proj(prefix_out[:, -self._num_prefix_rep_tokens])
-        return backward_rep, kv_cache, prefix_mask, prefix_tokens.shape[1]
+        psi_rep = self.psi_proj(prefix_out[:, -self._num_prefix_rep_tokens])
+        return psi_rep, kv_cache, prefix_mask, prefix_tokens.shape[1]
 
     def get_state_representations(
         self, observation: _model.Observation
     ) -> tuple[at.Float[at.Array, "b emb"], at.Float[at.Array, "b emb"], "KVCache", at.Bool[at.Array, "b s"], int]:
         """State-only mode: compute both representations from a single prefix pass.
 
-        Returns (backward_rep, forward_rep, kv_cache, prefix_mask, prefix_len).
+        Returns (psi_rep, phi_rep, kv_cache, prefix_mask, prefix_len).
         Both reps are action-independent; use this instead of
-        get_forward_representation when phi_input="state".
+        get_phi_representation when phi_input="state".
         """
         if not self._phi_on_prefix:
             raise ValueError("get_state_representations requires phi_input='state'")
@@ -325,11 +325,11 @@ class Pi0(_model.BaseModel):
         (prefix_out, _), kv_cache = self.PaliGemma.llm(
             [prefix_tokens, None], mask=prefix_attn_mask, positions=positions
         )
-        backward_rep = self.psi_proj(prefix_out[:, -2])
-        forward_rep = self.phi_proj(prefix_out[:, -1])
-        return backward_rep, forward_rep, kv_cache, prefix_mask, prefix_tokens.shape[1]
+        psi_rep = self.psi_proj(prefix_out[:, -2])
+        phi_rep = self.phi_proj(prefix_out[:, -1])
+        return psi_rep, phi_rep, kv_cache, prefix_mask, prefix_tokens.shape[1]
 
-    def get_forward_representation(
+    def get_phi_representation(
         self,
         observation: _model.Observation,
         noisy_actions: _model.Actions,
@@ -338,9 +338,9 @@ class Pi0(_model.BaseModel):
         prefix_mask: at.Bool[at.Array, "b s"],
         prefix_len: int,
     ) -> tuple[at.Float[at.Array, "*b emb"], at.Float[at.Array, "*b ah emb"], at.Float[at.Array, "*b ah ad"]]:
-        """Compute the action-dependent (forward) representation and velocity.
+        """Compute the action-dependent (phi) representation and velocity.
 
-        Returns (forward_rep, action_hidden, v_t) where forward_rep is the
+        Returns (phi_rep, action_hidden, v_t) where phi_rep is the
         phi_token output (last suffix token), action_hidden is the transformer
         hidden states for action tokens, and v_t is the velocity.
 
@@ -349,14 +349,14 @@ class Pi0(_model.BaseModel):
         """
         if self._phi_on_prefix:
             raise ValueError(
-                "get_forward_representation requires phi_input='state_action' (suffix phi); "
+                "get_phi_representation requires phi_input='state_action' (suffix phi); "
                 "with phi_input='state' use get_state_representations and compute_velocity_step."
             )
         suffix_out = self._suffix_forward(observation, noisy_actions, timestep, kv_cache, prefix_mask, prefix_len)
-        forward_rep = self.phi_proj(suffix_out[:, -1])
+        phi_rep = self.phi_proj(suffix_out[:, -1])
         action_hidden = self._action_hidden(suffix_out)
         v_t = self.action_out_proj(action_hidden)
-        return forward_rep, action_hidden, v_t
+        return phi_rep, action_hidden, v_t
 
     def get_prefix_cache(
         self, observation: _model.Observation
@@ -463,12 +463,12 @@ class Pi0(_model.BaseModel):
         crl_pos = jnp.diag(crl_matrix)
 
         # Symmetric InfoNCE: contrast over current states (axis=1) AND over futures (axis=0).
-        crl_neg_fwd = jax.nn.logsumexp(crl_matrix, axis=1)   # anchor psi_i, normalize over phi
-        crl_neg_bwd = jax.nn.logsumexp(crl_matrix, axis=0)   # anchor phi_j, normalize over psi
-        crl_loss = 0.5 * jnp.mean((crl_neg_fwd - crl_pos) + (crl_neg_bwd - crl_pos))
+        crl_neg_over_phi = jax.nn.logsumexp(crl_matrix, axis=1)   # anchor psi_i, normalize over phi
+        crl_neg_over_psi = jax.nn.logsumexp(crl_matrix, axis=0)   # anchor phi_j, normalize over psi
+        crl_loss = 0.5 * jnp.mean((crl_neg_over_phi - crl_pos) + (crl_neg_over_psi - crl_pos))
 
         # Logsumexp penalty (prevents logit blow-up / collapse; JaxGCRL uses coeff 0.1).
-        logsumexp_penalty = 0.5 * (jnp.mean(crl_neg_fwd**2) + jnp.mean(crl_neg_bwd**2))
+        logsumexp_penalty = 0.5 * (jnp.mean(crl_neg_over_phi**2) + jnp.mean(crl_neg_over_psi**2))
         crl_loss = crl_loss + 0.1 * logsumexp_penalty
 
         return action_loss + self.crl_loss_coeff * crl_loss, {"action_loss": action_loss, "rep_loss": crl_loss}

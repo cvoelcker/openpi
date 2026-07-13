@@ -228,7 +228,7 @@ class Pi0(_model.BaseModel):
         )
         return suffix_out
 
-    def get_backward_representation(
+    def get_psi_representation(
         self, observation: _model.Observation
     ) -> tuple[at.Float[at.Array, "b emb"], "KVCache", at.Bool[at.Array, "b s"], int]:
         observation = _model.preprocess_observation(None, observation, train=False)
@@ -238,10 +238,10 @@ class Pi0(_model.BaseModel):
         (prefix_out, _), kv_cache = self.PaliGemma.llm(
             [prefix_tokens, None], mask=prefix_attn_mask, positions=positions
         )
-        backward_rep = jnp.mean(prefix_out, axis=1)
-        return backward_rep, kv_cache, prefix_mask, prefix_tokens.shape[1]
+        psi_rep = jnp.mean(prefix_out, axis=1)
+        return psi_rep, kv_cache, prefix_mask, prefix_tokens.shape[1]
 
-    def get_forward_representation(
+    def get_phi_representation(
         self,
         observation: _model.Observation,
         noisy_actions: _model.Actions,
@@ -251,10 +251,10 @@ class Pi0(_model.BaseModel):
         prefix_len: int,
     ) -> tuple[at.Float[at.Array, "*b emb"], at.Float[at.Array, "*b ah emb"], at.Float[at.Array, "*b ah ad"]]:
         suffix_out = self._suffix_forward(observation, noisy_actions, timestep, kv_cache, prefix_mask, prefix_len)
-        forward_rep = jnp.mean(suffix_out, axis=1)
+        phi_rep = jnp.mean(suffix_out, axis=1)
         action_hidden = suffix_out[:, -self.action_horizon:]
         v_t = self.action_out_proj(action_hidden)
-        return forward_rep, action_hidden, v_t
+        return phi_rep, action_hidden, v_t
 
     def get_prefix_cache(
         self, observation: _model.Observation
