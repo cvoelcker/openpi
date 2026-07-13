@@ -1208,7 +1208,51 @@ _CONFIGS = [
         ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         ema_decay=0.999,
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_libero/params"),
+        num_train_steps=30_000,
+    ),
+
+    TrainConfig(
+        # Leaner-head variant of ..._frozen to test whether the train<<val rep gap is head
+        # over-capacity (memorization) rather than the same-episode collision artifact — the
+        # masked-vs-nomask diagnostic showed collisions explain only ~20% of the gap. Two
+        # capacity cuts vs the baseline: rep_dim 2048 -> 512 and rep_head_depth 2 -> 1 (halves
+        # the gemma blocks per head, also speeds up). Dropout stays at 0.1 so this isolates
+        # capacity. rep_dim / rep_head_depth don't affect backbone_frozen or the freeze regex,
+        # so the freeze_filter builder below only needs to mirror the two freeze-affecting coeffs.
+        name="pi05_crl_libero_full_finetune_frozen_lite",
+        model=pi0_config.Pi0RepConfig(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            rep_dim=512,
+            rep_head_depth=1,
+            action_loss_coeff=0.0,
+            rep_backbone_grad_scale=0.0,
+            rep_head_dropout=0.1,
+        ),
+        freeze_filter=pi0_config.Pi0RepConfig(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            action_loss_coeff=0.0,
+            rep_backbone_grad_scale=0.0,
+        ).get_freeze_filter(),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True, include_negative_observation=True),
+            extra_delta_transform=False,
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_libero/params"),
         num_train_steps=30_000,
     ),
 
