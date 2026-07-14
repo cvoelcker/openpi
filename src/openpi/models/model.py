@@ -226,6 +226,11 @@ class BaseModelConfig(abc.ABC):
     def model_type(self) -> ModelType:
         """The model type."""
 
+    @property
+    def requires_goal_data(self) -> bool:
+        """Whether training this model needs the goal-conditioned data loader (rl_data_loader)."""
+        return False
+
     @abc.abstractmethod
     def create(self, rng: at.KeyArrayLike) -> "BaseModel":
         """Create a new model, initializing parameters."""
@@ -259,6 +264,13 @@ class BaseModelConfig(abc.ABC):
         return jax.tree.map(lambda x: jnp.ones(x.shape, x.dtype), action_spec)
 
 
+def require_batch_keys(batch: dict, required: Sequence[str], model_name: str) -> None:
+    """Validate that a training batch contains every key the model's loss needs."""
+    missing = [k for k in required if batch.get(k) is None]
+    if missing:
+        raise ValueError(f"{model_name}.compute_loss: batch is missing required keys {missing} (has {sorted(batch)})")
+
+
 @dataclasses.dataclass
 class BaseModel(nnx.Module, abc.ABC):
     """Base class for all model implementations. Specific models should inherit from this class. They should call
@@ -273,11 +285,16 @@ class BaseModel(nnx.Module, abc.ABC):
     def compute_loss(
         self,
         rng: at.KeyArrayLike,
-        observation: Observation,
-        *args,
+        batch: dict,
+        *,
         train: bool = False,
-        **kwargs,
-    ) -> "at.Float[at.Array, '*b ah'] | tuple[at.Float[at.Array, '*b ah'], dict]": ...
+    ) -> "tuple[at.Float[at.Array, '*b ah'], dict]":
+        """Compute the training loss from a batch dict.
+
+        Every model requires at least the keys "observation" and "actions"; variants with
+        auxiliary losses validate and read the additional keys they need (e.g.
+        "future_observation") and ignore the rest. Returns (per-sample loss, info dict).
+        """
 
     @abc.abstractmethod
     def sample_actions(self, rng: at.KeyArrayLike, observation: Observation, **kwargs) -> Actions: ...

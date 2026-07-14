@@ -1,4 +1,5 @@
 import logging
+from typing import Any
 
 import einops
 import flax.nnx as nnx
@@ -64,6 +65,13 @@ def posemb_sincos(
 
 
 class Pi0(_model.BaseModel):
+    """Flow-matching VLA base model (pi0 / pi05).
+
+    Serves as the base class for the auxiliary-loss variants (Pi0CRL, Pi0SF): it owns the
+    backbone, the prefix/suffix embedding and forward helpers, action sampling, and the pure
+    flow-matching action loss. It computes no auxiliary losses.
+    """
+
     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         self.pi05 = config.pi05
@@ -83,6 +91,7 @@ class Pi0(_model.BaseModel):
                 configs=[paligemma_config, action_expert_config],
                 embed_dtype=config.dtype,
                 adarms=config.pi05,
+                return_hidden=True,
             )
         )
         llm.lazy_init(rngs=rngs, method="init", use_adarms=[False, True] if config.pi05 else [False, False])
@@ -107,10 +116,10 @@ class Pi0(_model.BaseModel):
             self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
 
-        # CRL-rep interface (mirrors pi05rep so the steering code can treat both
-        # models uniformly). Baseline pi0 has no learned readout tokens, so the
-        # reps are mean-pooled hidden states: phi = suffix mean (state-action,
-        # action-dependent), psi = prefix mean (state-only, action-independent).
+        # phi/psi steering interface. The base model has no learned readout heads, so the
+        # reps are mean-pooled hidden states (see get_prefix/suffix_mean_embedding):
+        # phi = suffix mean (state-action, action-dependent), psi = prefix mean (state-only).
+        # Subclasses with learned heads (Pi0RepBase) override these.
         self.phi_input = "state_action"
         self.psi_input = "state"
         self.phi_dim = action_expert_config.width
@@ -118,6 +127,14 @@ class Pi0(_model.BaseModel):
 
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
+
+    def _adarms_cond(
+        self, time_emb: at.Float[at.Array, "b emb"], z: at.Float[at.Array, "b d"] | None
+    ) -> at.Float[at.Array, "b emb"]:
+        """Hook for extra adaRMS conditioning. Subclasses (e.g. Pi0SF) mix in a task latent z."""
+        if z is not None:
+            raise ValueError(f"{type(self).__name__} does not support z conditioning")
+        return time_emb
 
     @at.typecheck
     def embed_prefix(
@@ -155,7 +172,11 @@ class Pi0(_model.BaseModel):
 
     @at.typecheck
     def embed_suffix(
-        self, obs: _model.Observation, noisy_actions: _model.Actions, timestep: at.Float[at.Array, " b"]
+        self,
+        obs: _model.Observation,
+        noisy_actions: _model.Actions,
+        timestep: at.Float[at.Array, " b"],
+        z: at.Float[at.Array, "b d"] | None = None,
     ) -> tuple[
         at.Float[at.Array, "b s emb"],
         at.Bool[at.Array, "b s"],
@@ -183,8 +204,10 @@ class Pi0(_model.BaseModel):
             time_emb = self.time_mlp_out(time_emb)
             time_emb = nnx.swish(time_emb)
             action_expert_tokens = action_tokens
-            adarms_cond = time_emb
+            adarms_cond = self._adarms_cond(time_emb, z)
         else:
+            if z is not None:
+                raise ValueError("z conditioning requires the pi05 adaRMS pathway")
             # mix timestep + action information using an MLP (no adaRMS)
             time_tokens = einops.repeat(time_emb, "b emb -> b s emb", s=self.action_horizon)
             action_time_tokens = jnp.concatenate([action_tokens, time_tokens], axis=-1)
@@ -202,6 +225,16 @@ class Pi0(_model.BaseModel):
         ar_mask = jnp.array(ar_mask)
         return tokens, input_mask, ar_mask, adarms_cond
 
+    def _run_prefix(self, observation: _model.Observation):
+        """Prefix-only backbone pass. Returns (prefix_out, prefix_hidden, kv_cache, prefix_mask, prefix_len)."""
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        (prefix_out, _), kv_cache, (prefix_hidden, _) = self.PaliGemma.llm(
+            [prefix_tokens, None], mask=attn_mask, positions=positions
+        )
+        return prefix_out, prefix_hidden, kv_cache, prefix_mask, prefix_tokens.shape[1]
+
     def _suffix_forward(
         self,
         observation: _model.Observation,
@@ -210,36 +243,95 @@ class Pi0(_model.BaseModel):
         kv_cache,
         prefix_mask: at.Bool[at.Array, "b s"],
         prefix_len: int,
+        z: at.Float[at.Array, "b d"] | None = None,
     ):
+        """Suffix-only forward against a prefix KV cache. Returns (suffix_out, suffix_hidden, suffix_mask)."""
         suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
-            observation, noisy_actions, timestep
+            observation, noisy_actions, timestep, z=z
         )
         suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
         prefix_attn_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
         full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
         positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
 
-        (_, suffix_out), _ = self.PaliGemma.llm(
+        (_, suffix_out), _, (_, suffix_hidden) = self.PaliGemma.llm(
             [None, suffix_tokens],
             mask=full_attn_mask,
             positions=positions,
             kv_cache=kv_cache,
             adarms_cond=[None, adarms_cond],
         )
-        return suffix_out
+        return suffix_out, suffix_hidden, suffix_mask
+
+    def _forward(
+        self,
+        observation: _model.Observation,
+        x_t: _model.Actions,
+        time: at.Float[at.Array, " b"],
+        z: at.Float[at.Array, "b d"] | None = None,
+    ):
+        """Single PaliGemma forward over prefix + suffix at once.
+
+        Returns (suffix_out, prefix_hidden, suffix_hidden, prefix_mask, suffix_mask).
+        """
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, time, z=z)
+        input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
+        ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
+        attn_mask = make_attn_mask(input_mask, ar_mask)
+        positions = jnp.cumsum(input_mask, axis=1) - 1
+        (_, suffix_out), _, (prefix_hidden, suffix_hidden) = self.PaliGemma.llm(
+            [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions, adarms_cond=[None, adarms_cond]
+        )
+        return suffix_out, prefix_hidden, suffix_hidden, prefix_mask, suffix_mask
+
+    def _sample_flow(self, rng: at.KeyArrayLike, actions: _model.Actions):
+        """Sample the flow-matching interpolation. Returns (x_t, u_t, time)."""
+        noise_rng, time_rng = jax.random.split(rng)
+        batch_shape = actions.shape[:-2]
+        noise = jax.random.normal(noise_rng, actions.shape)
+        time = jax.random.beta(time_rng, 1.5, 1, batch_shape) * 0.999 + 0.001
+        time_expanded = time[..., None, None]
+        x_t = time_expanded * noise + (1 - time_expanded) * actions
+        u_t = noise - actions
+        return x_t, u_t, time
+
+    def get_prefix_mean_embedding(
+        self, observation: _model.Observation
+    ) -> tuple[at.Float[at.Array, "b emb"], "KVCache", at.Bool[at.Array, "b s"], int]:
+        """Mean-pooled backbone embedding of the prefix (state-only, action-independent).
+
+        The steering primitive for the state side, independent of any learned phi/psi heads.
+        Returns (embedding, kv_cache, prefix_mask, prefix_len).
+        """
+        observation = _model.preprocess_observation(None, observation, train=False)
+        prefix_out, _, kv_cache, prefix_mask, prefix_len = self._run_prefix(observation)
+        return jnp.mean(prefix_out, axis=1), kv_cache, prefix_mask, prefix_len
+
+    def get_suffix_mean_embedding(
+        self,
+        observation: _model.Observation,
+        noisy_actions: _model.Actions,
+        timestep: at.Float[at.Array, "b"],
+        kv_cache,
+        prefix_mask: at.Bool[at.Array, "b s"],
+        prefix_len: int,
+    ) -> tuple[at.Float[at.Array, "*b emb"], at.Float[at.Array, "*b ah emb"], at.Float[at.Array, "*b ah ad"]]:
+        """Mean-pooled action-expert embedding of the suffix (state-action, action-dependent).
+
+        The steering primitive for the action side, independent of any learned phi/psi heads.
+        Returns (embedding, action_hidden, v_t).
+        """
+        suffix_out, _, _ = self._suffix_forward(observation, noisy_actions, timestep, kv_cache, prefix_mask, prefix_len)
+        action_hidden = suffix_out[:, -self.action_horizon :]
+        v_t = self.action_out_proj(action_hidden)
+        return jnp.mean(suffix_out, axis=1), action_hidden, v_t
 
     def get_psi_representation(
         self, observation: _model.Observation
     ) -> tuple[at.Float[at.Array, "b emb"], "KVCache", at.Bool[at.Array, "b s"], int]:
-        observation = _model.preprocess_observation(None, observation, train=False)
-        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
-        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
-        positions = jnp.cumsum(prefix_mask, axis=1) - 1
-        (prefix_out, _), kv_cache = self.PaliGemma.llm(
-            [prefix_tokens, None], mask=prefix_attn_mask, positions=positions
-        )
-        psi_rep = jnp.mean(prefix_out, axis=1)
-        return psi_rep, kv_cache, prefix_mask, prefix_tokens.shape[1]
+        """Steering-compat alias: the base model's psi is the mean prefix embedding."""
+        return self.get_prefix_mean_embedding(observation)
 
     def get_phi_representation(
         self,
@@ -250,22 +342,15 @@ class Pi0(_model.BaseModel):
         prefix_mask: at.Bool[at.Array, "b s"],
         prefix_len: int,
     ) -> tuple[at.Float[at.Array, "*b emb"], at.Float[at.Array, "*b ah emb"], at.Float[at.Array, "*b ah ad"]]:
-        suffix_out = self._suffix_forward(observation, noisy_actions, timestep, kv_cache, prefix_mask, prefix_len)
-        phi_rep = jnp.mean(suffix_out, axis=1)
-        action_hidden = suffix_out[:, -self.action_horizon:]
-        v_t = self.action_out_proj(action_hidden)
-        return phi_rep, action_hidden, v_t
+        """Steering-compat alias: the base model's phi is the mean suffix embedding."""
+        return self.get_suffix_mean_embedding(observation, noisy_actions, timestep, kv_cache, prefix_mask, prefix_len)
 
     def get_prefix_cache(
         self, observation: _model.Observation
     ) -> tuple["KVCache", at.Float[at.Array, "b s emb"], at.Bool[at.Array, "b s"]]:
+        """Returns (kv_cache, prefix_out, prefix_mask) for iterative suffix passes."""
         observation = _model.preprocess_observation(None, observation, train=False)
-        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
-        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
-        positions = jnp.cumsum(prefix_mask, axis=1) - 1
-        (prefix_out, _), kv_cache = self.PaliGemma.llm(
-            [prefix_tokens, None], mask=prefix_attn_mask, positions=positions
-        )
+        prefix_out, _, kv_cache, prefix_mask, _ = self._run_prefix(observation)
         return kv_cache, prefix_out, prefix_mask
 
     def compute_velocity_step(
@@ -276,45 +361,34 @@ class Pi0(_model.BaseModel):
         kv_cache,
         prefix_mask: at.Bool[at.Array, "b s"],
     ) -> at.Float[at.Array, "b ah ad"]:
+        """Compute the velocity at a single ODE step against a cached prefix."""
         batch_size = x_t.shape[0]
         timestep = jnp.broadcast_to(jnp.asarray(t_pi0), (batch_size,))
         prefix_len = prefix_mask.shape[1]
-        suffix_out = self._suffix_forward(observation, x_t, timestep, kv_cache, prefix_mask, prefix_len)
-        action_hidden = suffix_out[:, -self.action_horizon:]
-        return self.action_out_proj(action_hidden)
+        suffix_out, _, _ = self._suffix_forward(observation, x_t, timestep, kv_cache, prefix_mask, prefix_len)
+        return self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
     @override
     def compute_loss(
-        self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
-    ) -> at.Float[at.Array, "*b ah"]:
-        # for CRL, we need two tokens, and pass both current state and future state here
-        preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
+        self,
+        rng: at.KeyArrayLike,
+        batch: dict[str, Any],
+        *,
+        train: bool = False,
+    ) -> tuple[at.Float[at.Array, "*b ah"], dict[str, at.Array]]:
+        """Flow-matching action loss. Requires batch keys: observation, actions."""
+        _model.require_batch_keys(batch, ("observation", "actions"), type(self).__name__)
+        observation, actions = batch["observation"], batch["actions"]
+
+        preprocess_rng, flow_rng = jax.random.split(rng)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
+        x_t, u_t, time = self._sample_flow(flow_rng, actions)
 
-        batch_shape = actions.shape[:-2]
-        noise = jax.random.normal(noise_rng, actions.shape)
-        time = jax.random.beta(time_rng, 1.5, 1, batch_shape) * 0.999 + 0.001
-        time_expanded = time[..., None, None]
-        x_t = time_expanded * noise + (1 - time_expanded) * actions
-        u_t = noise - actions
-
-        # one big forward pass of prefix + suffix at once
-        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
-        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, time)
-        # add new readout token to repfix with fixed learnable vector
-        # read out last entry in prefix out and apply loss there
-        input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
-        ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
-        attn_mask = make_attn_mask(input_mask, ar_mask)
-        positions = jnp.cumsum(input_mask, axis=1) - 1
-        (prefix_out, suffix_out), _ = self.PaliGemma.llm(
-            [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions, adarms_cond=[None, adarms_cond]
-        )
+        suffix_out, *_ = self._forward(observation, x_t, time)
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
-        # add CRL loss and construct matrix
-
-        return jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        action_loss = jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        return action_loss, {"action_loss": jnp.mean(action_loss)}
 
     @override
     def sample_actions(
@@ -334,41 +408,18 @@ class Pi0(_model.BaseModel):
             noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
 
         # first fill KV cache with a forward pass of the prefix
-        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
-        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
-        positions = jnp.cumsum(prefix_mask, axis=1) - 1
-        _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
+        _, _, kv_cache, prefix_mask, prefix_len = self._run_prefix(observation)
 
         def step(carry):
             x_t, time = carry
-            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
-                observation, x_t, jnp.broadcast_to(time, batch_size)
+            suffix_out, _, _ = self._suffix_forward(
+                observation,
+                x_t,
+                jnp.broadcast_to(time, batch_size),
+                kv_cache,
+                prefix_mask,
+                prefix_len,
             )
-            # `suffix_attn_mask` is shape (b, suffix_len, suffix_len) indicating how the suffix tokens can attend to each
-            # other
-            suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
-            # `prefix_attn_mask` is shape (b, suffix_len, prefix_len) indicating how the suffix tokens can attend to the
-            # prefix tokens
-            prefix_attn_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
-            # `combined_mask` is shape (b, suffix_len, prefix_len + suffix_len) indicating how the suffix tokens (which
-            # generate the queries) can attend to the full prefix + suffix sequence (which generates the keys and values)
-            full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
-            assert full_attn_mask.shape == (
-                batch_size,
-                suffix_tokens.shape[1],
-                prefix_tokens.shape[1] + suffix_tokens.shape[1],
-            )
-            # `positions` is shape (b, suffix_len) indicating the positions of the suffix tokens
-            positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
-
-            (prefix_out, suffix_out), _ = self.PaliGemma.llm(
-                [None, suffix_tokens],
-                mask=full_attn_mask,
-                positions=positions,
-                kv_cache=kv_cache,
-                adarms_cond=[None, adarms_cond],
-            )
-            assert prefix_out is None
             v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
             return x_t + dt * v_t, time + dt

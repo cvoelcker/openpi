@@ -52,16 +52,32 @@ def _bounds_from_episodes(episodes: list[tuple[int, int]]) -> tuple[np.ndarray, 
 
 
 def _make_dataset(
-    episodes, *, gamma=0.9, future_uniform=True, seed=0, action_chunk_size=1
+    episodes,
+    *,
+    gamma=0.9,
+    future_gamma=0.9,
+    seed=0,
+    action_chunk_size=1,
+    include_negative_observation=False,
+    random_future_control=False,
 ) -> _rl.RandomFutureDataset:
     ep_start, ep_end = _bounds_from_episodes(episodes)
     num_frames = len(ep_start)
+    frame_task = task_to_frames = None
+    if include_negative_observation:
+        # Single task covering the whole toy dataset.
+        frame_task = np.zeros(num_frames, dtype=np.int64)
+        task_to_frames = _rl._build_task_to_frames(frame_task)  # noqa: SLF001
     return _rl.RandomFutureDataset(
         _FakeTransformedDataset(num_frames),
         ep_start,
         ep_end,
-        sampling=_rl.GoalSamplingConfig(gamma=gamma, future_uniform=future_uniform, seed=seed),
+        sampling=_rl.GoalSamplingConfig(gamma=gamma, future_gamma=future_gamma, seed=seed),
         action_chunk_size=action_chunk_size,
+        include_negative_observation=include_negative_observation,
+        random_future_control=random_future_control,
+        frame_task=frame_task,
+        task_to_frames=task_to_frames,
     )
 
 
@@ -77,11 +93,10 @@ def test_per_frame_episode_bounds():
     assert ep_end.tolist() == [5, 5, 5, 5, 5, 9, 9, 9, 9]
 
 
-@pytest.mark.parametrize("future_uniform", [True, False])
-def test_sampling_invariants(future_uniform):
+def test_sampling_invariants():
     episodes = [(0, 5), (5, 9)]
     ep_start, ep_end = _bounds_from_episodes(episodes)
-    ds = _make_dataset(episodes, future_uniform=future_uniform)
+    ds = _make_dataset(episodes)
 
     for t in range(len(ep_start)):
         start, end = int(ep_start[t]), int(ep_end[t])
@@ -104,8 +119,10 @@ def test_sampling_invariants(future_uniform):
                 assert not bool(pads["next_is_pad"])
                 assert not bool(pads["future_is_pad"])
                 assert not bool(pads["goal_is_pad"])
-                # "future-then-goal": t < future <= goal
-                assert t < future_idx <= goal_idx
+                # The positive future is a strict future within the episode. It is now sampled
+                # independently of the goal (geometric over the remaining episode), so it is NOT
+                # constrained to be <= goal.
+                assert future_idx > t
 
 
 def test_goal_offset_clamped_to_episode():
@@ -132,7 +149,6 @@ def test_chunk_indices_are_chunk_aligned(chunk_size):
             if not pads["future_is_pad"]:
                 assert (future_idx - t) % chunk_size == 0
                 assert (goal_idx - t) % chunk_size == 0
-                assert future_idx <= goal_idx
 
 
 @pytest.mark.parametrize("chunk_size", [2, 3])
@@ -151,6 +167,75 @@ def test_chunk_last_chunk_frames_are_padded(chunk_size):
         else:
             assert not pads["future_is_pad"], f"t={t} should have future available"
             assert not pads["goal_is_pad"]
+
+
+@pytest.mark.parametrize("gamma", [0.5, 0.9])
+def test_truncated_geometric_marginal(gamma):
+    """The future offset marginal must match a geometric renormalized over [1, N] -- not a
+    boundary-piling clamp, and not the old goal-coupled compound distribution."""
+    rng = np.random.default_rng(0)
+    n = 8
+    samples = np.array([_rl.RandomFutureDataset._sample_truncated_geometric(n, gamma, rng) for _ in range(200_000)])  # noqa: SLF001
+    counts = np.bincount(samples, minlength=n + 1)[1 : n + 1]
+    emp = counts / counts.sum()
+    k = np.arange(1, n + 1)
+    expected = (1 - gamma) * gamma ** (k - 1)
+    expected = expected / expected.sum()
+    assert np.max(np.abs(emp - expected)) < 0.01
+    # Monotonically decreasing (no spike at the boundary offset n).
+    assert emp[-1] < emp[0]
+
+
+def test_within_task_negative_structure_and_sampling():
+    # Two episodes, one shared task -> negatives may come from either episode.
+    ds = _make_dataset([(0, 5), (5, 10)], include_negative_observation=True)
+    item = ds[0]
+    assert "negative_observation" in item
+    assert "actions" not in item["negative_observation"]
+    # Negative is drawn from anywhere in the (single) task -> over many draws it must span both
+    # episodes, i.e. it is not restricted to the anchor's own trajectory.
+    neg_frames = {int(ds[0]["negative_observation"]["state"][0]) for _ in range(300)}
+    assert min(neg_frames) < 5 and max(neg_frames) >= 5
+
+
+def test_random_future_control_pairing():
+    """Randomization-test mode: the CRL positive must be (a) from a different episode, (b) a FIXED
+    partner per anchor across repeated fetches/epochs (else it cannot be memorized and the control
+    is vacuous), and (c) never flagged as pad. Other keys keep their real semantics."""
+    episodes = [(0, 5), (5, 10), (10, 15)]
+    ds = _make_dataset(episodes, random_future_control=True)
+    ep_start, _ = _bounds_from_episodes(episodes)
+
+    for t in range(15):
+        partners = {int(ds[t]["future_observation"]["state"][0]) for _ in range(20)}
+        assert len(partners) == 1, f"pairing not fixed across epochs for t={t}: {partners}"
+        partner = partners.pop()
+        assert ep_start[partner] != ep_start[t], f"partner shares anchor's episode: t={t}"
+        assert not bool(ds[t]["future_is_pad"])
+        # next/goal keep real (within-episode) semantics.
+        assert ep_start[int(ds[t]["next_observation"]["state"][0])] == ep_start[t]
+        assert ep_start[int(ds[t]["goal_observation"]["state"][0])] == ep_start[t]
+
+    # The pairing is a pure function of (seed, anchor) — identical across dataset instances...
+    ds_b = _make_dataset(episodes, random_future_control=True)
+    assert all(
+        int(ds[t]["future_observation"]["state"][0]) == int(ds_b[t]["future_observation"]["state"][0])
+        for t in range(15)
+    )
+    # ...and changes with the seed (not a constant mapping).
+    ds_c = _make_dataset(episodes, random_future_control=True, seed=1)
+    assert any(
+        int(ds[t]["future_observation"]["state"][0]) != int(ds_c[t]["future_observation"]["state"][0])
+        for t in range(15)
+    )
+
+
+def test_random_future_control_single_episode_fallback():
+    # Degenerate dataset with no cross-episode partner: falls back to t and flags pad.
+    ds = _make_dataset([(0, 5)], random_future_control=True)
+    item = ds[2]
+    assert int(item["future_observation"]["state"][0]) == 2
+    assert bool(item["future_is_pad"])
 
 
 def test_sampling_is_seeded_deterministic():
@@ -174,11 +259,32 @@ def test_item_structure_strips_aux_actions():
         "future_is_pad",
         "goal_is_pad",
         "actions",
+        "episode_id",
+        "frame_index",
+        "next_frame_index",
+        "future_frame_index",
+        "future_episode_id",
+        "goal_frame_index",
     }
     # Auxiliary frames should not carry the (redundant) action chunk.
     for key in ["observation", "next_observation", "future_observation", "goal_observation"]:
         assert "actions" not in item[key]
     assert item["actions"].shape == (ACTION_HORIZON, ACTION_DIM)
+
+
+def test_frame_indices_match_fetched_frames():
+    """The emitted *_frame_index keys must agree with the frames actually fetched (whose state
+    fields encode their index in the fake dataset), and episode ids must be the episode starts."""
+    ds = _make_dataset([(0, 5), (5, 10)], include_negative_observation=True)
+    for t in [0, 2, 6]:
+        item = ds[t]
+        assert int(item["frame_index"]) == t
+        assert int(item["episode_id"]) == (0 if t < 5 else 5)
+        for name in ("next", "future", "goal", "negative"):
+            idx = int(item[f"{name}_frame_index"])
+            assert int(item[f"{name}_observation"]["state"][0]) == idx
+        assert int(item["future_episode_id"]) == (0 if int(item["future_frame_index"]) < 5 else 5)
+        assert int(item["negative_episode_id"]) == (0 if int(item["negative_frame_index"]) < 5 else 5)
 
 
 def test_anchor_observation_matches_index():

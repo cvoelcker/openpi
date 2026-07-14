@@ -296,6 +296,9 @@ class Block(nn.Module):
 
     dropout: float = 0.0
     dropout_bdims: tuple[int, ...] = ()
+    # When True, the post-block residual is emitted as an extra scan output so the
+    # Module can return per-layer hidden states (used by the CRL rep heads).
+    return_hidden: bool = False
 
     @nn.compact
     def __call__(self, xs, kv_cache, positions, attn_mask, adarms_cond, deterministic=True):  # noqa: FBT002
@@ -338,6 +341,9 @@ class Block(nn.Module):
         xs = [_gated_residual(x, y, gate) for x, y, gate in zip(xs, out, gates, strict=True)]
         xs = sharding.activation_sharding_constraint(xs)
 
+        if self.return_hidden:
+            # Emit the residual as a second scan output; nn.scan stacks it over layers.
+            return xs, (kv_cache, xs)
         return xs, kv_cache
 
 
@@ -353,6 +359,9 @@ class Module(nn.Module):
 
     dropout: float = 0.0
     dropout_bdims: tuple[int, ...] = ()  # Every float is dropped independently.
+    # When True, __call__ additionally returns per-layer hidden states (one stacked
+    # (L, b, t, d) array per expert). Off by default so non-rep models are unaffected.
+    return_hidden: bool = False
     adarms: bool = False
 
     def setup(self):
@@ -386,6 +395,7 @@ class Module(nn.Module):
             configs=self.configs,
             dropout=self.dropout,
             dropout_bdims=self.dropout_bdims,
+            return_hidden=self.return_hidden,
         )
         self.final_norms = [RMSNorm(name=_name("final_norm", i)) for i in range(len(self.configs))]
 
@@ -404,19 +414,34 @@ class Module(nn.Module):
         *,
         kv_cache: KVCache | None = None,
         deterministic: bool = True,
-    ) -> tuple[Sequence[at.Float[at.Array, "b _t _d"] | None], KVCache]:
+    ) -> (
+        tuple[Sequence[at.Float[at.Array, "b _t _d"] | None], KVCache]
+        | tuple[
+            Sequence[at.Float[at.Array, "b _t _d"] | None],
+            KVCache,
+            Sequence[at.Float[at.Array, "l b _t _d"] | None],
+        ]
+    ):
         embedded = jax.tree.map(lambda e: e.astype(self.embed_dtype), embedded)
         mask = jnp.asarray(mask)[:, None, :, :]
         if adarms_cond is None:
             adarms_cond = [None] * len(self.configs)
 
-        embedded, kv_cache = self.layers(embedded, kv_cache, positions, mask, adarms_cond, deterministic)
+        if self.return_hidden:
+            embedded, (kv_cache, hidden) = self.layers(
+                embedded, kv_cache, positions, mask, adarms_cond, deterministic
+            )
+        else:
+            embedded, kv_cache = self.layers(embedded, kv_cache, positions, mask, adarms_cond, deterministic)
 
         assert all(e.dtype == jnp.dtype(self.embed_dtype) for e in embedded if e is not None)
 
-        return [
+        outputs = [
             f(e, a)[0] if e is not None else e for f, e, a in zip(self.final_norms, embedded, adarms_cond, strict=True)
-        ], kv_cache
+        ]
+        if self.return_hidden:
+            return outputs, kv_cache, hidden
+        return outputs, kv_cache
 
     def init(self, use_adarms: Sequence[bool]):
         """Convenience method for initializing all parameters, necessary due to the quirks of linen."""

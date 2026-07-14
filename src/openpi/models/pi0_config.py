@@ -13,7 +13,8 @@ import openpi.shared.nnx_utils as nnx_utils
 
 if TYPE_CHECKING:
     from openpi.models.pi0 import Pi0
-    from openpi.models.pi05rep import Pi0 as Pi0Rep
+    from openpi.models.pi05crl import Pi0CRL
+    from openpi.models.pi05sf import Pi0SF
 
 
 @dataclasses.dataclass(frozen=True)
@@ -123,56 +124,129 @@ class Pi0Config(_model.BaseModelConfig):
         return nnx.All(*filters)
 
 
-@dataclasses.dataclass(frozen=True)
-class Pi0RepConfig(Pi0Config):
-    """Config for the CRL representation-learning variant of Pi0.
+_REP_INPUTS = ("state", "state_action")
 
-    Identical architecture to Pi0Config (pi05=True by default) but instantiates
-    pi05rep.Pi0, which adds phi/psi readout tokens for contrastive RL training.
+
+@dataclasses.dataclass(frozen=True)
+class Pi0RepBaseConfig(Pi0Config):
+    """Shared config for the phi/psi representation-head variants (Pi0CRL, Pi0SF).
+
+    Identical backbone to Pi0Config (pi05=True by default) plus dedicated phi/psi
+    attention-pooling heads that pool a learned mix over all backbone layers
+    (see rep_base.Pi0RepBase). Subclasses add their auxiliary loss.
     """
 
     pi05: bool = True
+    # phi/psi representation dimension. Both reps project to rep_dim.
     rep_dim: int = 512
-    crl_loss_coeff: float = 0.01
-    # Input the phi (current-time CRL anchor) representation is trained on:
-    # "state_action" — phi token lives on the action suffix and sees the noisy
-    # action tokens (Q-value style, the default); "state" — phi token joins psi
-    # on the prefix (the state-only portion of the VLA backbone), making both
-    # representations action-independent (state-value style). psi (the future-
-    # time CRL target) is always state-input by design. The two rep tokens
-    # never attend to each other.
+    # Weight on the flow-matching action loss. 1.0 = normal joint training; 0.0
+    # switches the action loss off entirely for pure representation learning. Note:
+    # with action_loss_coeff=0.0 AND rep_backbone_grad_scale=0.0 the backbone gets
+    # no gradient, so `get_freeze_filter` freezes it outright (see `backbone_frozen`):
+    # only the phi/psi heads are trainable and the backbone's backward pass and
+    # optimizer state are skipped. Raise rep_backbone_grad_scale to instead train
+    # the backbone from the rep loss alone.
+    action_loss_coeff: float = 1.0
+    # Number of gemma blocks in each (phi/psi) representation head. Per-config
+    # hyperparameter: raise for more head capacity, lower (e.g. 1) for leaner heads.
+    rep_head_depth: int = 2
+    # How much of the auxiliary (rep) loss gradient flows into the shared backbone.
+    # 0.0 => full stop_gradient (backbone shaped only by the action loss; the rep heads
+    # are read-only probes over a learned layer-mix). Values in (0, 1] scale the leak.
+    rep_backbone_grad_scale: float = 0.0
+    # Input each representation is trained on:
+    # "state_action" — the rep head reads the action suffix and sees the (noisy)
+    # action tokens (Q-value style); "state" — the rep head reads the prefix (the
+    # state-only portion of the VLA backbone), making it action-independent
+    # (state-value style). Defaults preserve the original behavior: phi (the
+    # current-time anchor) is state_action, psi (the future-time target) is state.
+    # The rep heads never attend to each other.
     phi_input: str = "state_action"
+    psi_input: str = "state"
+    # Dropout applied inside the phi/psi rep heads (on the pooled query vector) during
+    # training only. 0.0 = off. A regularizer for the small trainable head set over a
+    # frozen backbone; helps close the train<<val rep-loss gap.
+    rep_head_dropout: float = 0.0
 
     def __post_init__(self):
         super().__post_init__()
-        if self.phi_input not in ("state_action", "state"):
-            raise ValueError(
-                f"phi_input must be 'state_action' or 'state', got {self.phi_input!r}"
-            )
+        if self.phi_input not in _REP_INPUTS:
+            raise ValueError(f"phi_input must be one of {_REP_INPUTS}, got {self.phi_input!r}")
+        if self.psi_input not in _REP_INPUTS:
+            raise ValueError(f"psi_input must be one of {_REP_INPUTS}, got {self.psi_input!r}")
+
+    @property
+    @override
+    def requires_goal_data(self) -> bool:
+        return True
+
+    @property
+    def backbone_frozen(self) -> bool:
+        """True when the shared backbone receives no gradient and can be frozen.
+
+        This holds when the action loss is off (``action_loss_coeff == 0.0``) AND no
+        rep-loss gradient leaks into the backbone (``rep_backbone_grad_scale == 0.0``).
+        In that regime only the phi/psi rep heads are trainable, so the backbone's
+        backward pass and optimizer state can be skipped entirely.
+        """
+        return self.action_loss_coeff == 0.0 and self.rep_backbone_grad_scale == 0.0
 
     @override
-    def create(self, rng: at.KeyArrayLike) -> "Pi0Rep":
-        from openpi.models.pi05rep import Pi0 as Pi0Rep
-
-        return Pi0Rep(self, rngs=nnx.Rngs(rng))
+    def get_freeze_filter(self) -> nnx.filterlib.Filter:
+        # When the backbone gets no gradient, freeze everything except the rep heads
+        # (phi/psi head blocks, layer-mix logits, and output projections, plus the
+        # learnable CRL temperature logit_scale where present). This drops the backbone
+        # from the trainable set, so its backward pass and optimizer state are never
+        # materialized — a large speed and memory win. (Pi0SF's z_proj is excluded on
+        # purpose: its gradient path runs through the stop-gradiented backbone, so it
+        # cannot train in this regime anyway.)
+        if self.backbone_frozen:
+            rep_head_filter = nnx_utils.PathRegex(r".*((phi|psi)_(head|mix|proj)|logit_scale).*")
+            return nnx.Not(rep_head_filter)
+        return super().get_freeze_filter()
 
 
 @dataclasses.dataclass(frozen=True)
-class Pi0SFConfig(Pi0Config):
+class Pi0CRLConfig(Pi0RepBaseConfig):
+    """Config for the contrastive-RL (CRL) representation-learning variant of Pi0.
+
+    Instantiates pi05crl.Pi0CRL, which trains the phi/psi heads with a symmetric
+    InfoNCE loss alongside the flow-matching action loss.
+    """
+
+    crl_loss_coeff: float = 0.01
+    # CRL reps are L2-normalized before the InfoNCE dot products, so logits are cosine
+    # similarities in [-1, 1]. A learnable temperature (initialized to this value, CLIP-style)
+    # restores separability; without it normalized logits can't sharpen. Stored as a learnable
+    # logit_scale = log(1/temperature); clamped at exp <= 100 to avoid runaway.
+    crl_temperature_init: float = 0.07
+    # Coefficient on the logsumexp penalty (guards against logit blow-up / collapse). With
+    # L2-norm + temperature the logit scale is already bounded, so this defaults lower than the
+    # old hardcoded 0.1. Set to 0.0 to disable.
+    logsumexp_penalty_coeff: float = 0.01
+
+    @override
+    def create(self, rng: at.KeyArrayLike) -> "Pi0CRL":
+        from openpi.models.pi05crl import Pi0CRL
+
+        return Pi0CRL(self, rngs=nnx.Rngs(rng))
+
+
+@dataclasses.dataclass(frozen=True)
+class Pi0SFConfig(Pi0RepBaseConfig):
     """Config for the TD Successor-Features variant of Pi0.
 
-    Identical backbone to Pi0Config (pi05=True) but instantiates pi05sf.Pi0SF, which adds
-    a feature token phi(s) and a successor token psi(s,a) trained with a semi-gradient
+    Instantiates pi05sf.Pi0SF, which trains the phi/psi heads with a semi-gradient
     SARSA TD loss alongside the flow-matching action loss.
     """
 
-    pi05: bool = True
-    sf_dim: int = 256  # dimension of phi/psi successor features
     sf_gamma: float = 0.98  # TD discount
     fb_train_goal_ratio: float = 0.5  # fraction of the batch whose z = B(future); rest random
+    # Weight on the TD successor-feature loss (Pi0CRLConfig's crl_loss_coeff analogue).
+    sf_loss_coeff: float = 1.0
 
     @override
-    def create(self, rng: at.KeyArrayLike) -> "Pi0SF":  # noqa: F821
+    def create(self, rng: at.KeyArrayLike) -> "Pi0SF":
         from openpi.models.pi05sf import Pi0SF
 
         return Pi0SF(self, rngs=nnx.Rngs(rng))

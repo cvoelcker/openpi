@@ -17,13 +17,13 @@ import optax
 import tqdm_loggable.auto as tqdm
 import wandb
 
-import openpi.models.model as _model
 import openpi.shared.array_typing as at
 import openpi.shared.nnx_utils as nnx_utils
 import openpi.training.checkpoints as _checkpoints
 import openpi.training.config as _config
 import openpi.training.data_loader as _data_loader
 import openpi.training.optimizer as _optimizer
+import openpi.training.rl_data_loader as _rl_data_loader
 import openpi.training.sharding as sharding
 import openpi.training.utils as training_utils
 import openpi.training.weight_loaders as _weight_loaders
@@ -72,14 +72,40 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = 
 
 
 def _load_weights_and_validate(loader: _weight_loaders.WeightLoader, params_shape: at.Params) -> at.Params:
-    """Loads and validates the weights. Returns a loaded subset of the weights."""
+    """Loads and validates the weights. Returns a loaded subset of the weights.
+
+    Params present in params_shape but absent from the checkpoint (e.g. newly added
+    phi/psi rep heads) are silently skipped — the model keeps its freshly-initialized values.
+    """
     loaded_params = loader.load(params_shape)
+
+    # Fill any newly-added params that the checkpoint doesn't know about with their
+    # ShapeDtypeStruct placeholder so the tree structure matches for validation.
+    flat_loaded = traverse_util.flatten_dict(loaded_params)
+    flat_shape = traverse_util.flatten_dict(params_shape)
+    for k, v in flat_shape.items():
+        if k not in flat_loaded:
+            flat_loaded[k] = v
+    loaded_params = traverse_util.unflatten_dict(flat_loaded)
+
     at.check_pytree_equality(expected=params_shape, got=loaded_params, check_shapes=True, check_dtypes=True)
 
-    # Remove jax.ShapeDtypeStruct from the loaded params. This makes sure that only the loaded params are returned.
+    # Remove ShapeDtypeStruct placeholders — only actually-loaded params are returned.
     return traverse_util.unflatten_dict(
         {k: v for k, v in traverse_util.flatten_dict(loaded_params).items() if not isinstance(v, jax.ShapeDtypeStruct)}
     )
+
+
+def _as_batch_dict(batch) -> dict[str, Any]:
+    """Normalize a data-loader batch to the model's batch-dict convention.
+
+    The standard data loader yields (Observation, Actions) tuples; the goal-conditioned
+    loader already yields dicts (observation, actions, future_observation, ...).
+    """
+    if isinstance(batch, dict):
+        return batch
+    observation, actions = batch
+    return {"observation": observation, "actions": actions}
 
 
 @at.typecheck
@@ -139,24 +165,20 @@ def train_step(
     config: _config.TrainConfig,
     rng: at.KeyArrayLike,
     state: training_utils.TrainState,
-    batch: tuple[_model.Observation, _model.Actions],
+    batch: dict,
 ) -> tuple[training_utils.TrainState, dict[str, at.Array]]:
     model = nnx.merge(state.model_def, state.params)
     model.train()
 
-    @at.typecheck
-    def loss_fn(
-        model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions
-    ):
-        chunked_loss = model.compute_loss(rng, observation, actions, train=True)
-        return jnp.mean(chunked_loss)
+    def loss_fn(model, rng: at.KeyArrayLike, batch: dict):
+        chunked_loss, log_dict = model.compute_loss(rng, batch, train=True)
+        return jnp.mean(chunked_loss), log_dict
 
     train_rng = jax.random.fold_in(rng, state.step)
-    observation, actions = batch
 
     # Filter out frozen params.
     diff_state = nnx.DiffState(0, config.trainable_filter)
-    loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model, train_rng, observation, actions)
+    ((loss, log_dict), grads) = nnx.value_and_grad(loss_fn, argnums=diff_state, has_aux=True)(model, train_rng, batch)
 
     params = state.params.filter(config.trainable_filter)
     updates, new_opt_state = state.tx.update(grads, state.opt_state, params)
@@ -188,6 +210,7 @@ def train_step(
         "loss": loss,
         "grad_norm": optax.global_norm(grads),
         "param_norm": optax.global_norm(kernel_params),
+        **{k: jnp.mean(v) for k, v in log_dict.items()},
     }
     return new_state, info
 
@@ -196,15 +219,16 @@ def train_step(
 def val_step(
     state: training_utils.TrainState,
     rng: at.KeyArrayLike,
-    batch: tuple[_model.Observation, _model.Actions],
+    batch: dict,
 ) -> dict[str, at.Array]:
     params = state.ema_params if state.ema_params is not None else state.params
     model = nnx.merge(state.model_def, params)
     model.eval()
 
-    observation, actions = batch
-    chunked_loss = model.compute_loss(rng, observation, actions, train=False)
-    return {"val/loss": jnp.mean(chunked_loss)}
+    # The model reads the keys it needs from the batch (e.g. the CRL ranking probe picks up
+    # the frame-index keys at val time) and ignores the rest.
+    chunked_loss, log_dict = model.compute_loss(rng, batch, train=False)
+    return {"val/loss": jnp.mean(chunked_loss), **{f"val/{k}": jnp.mean(v) for k, v in log_dict.items()}}
 
 
 def main(config: _config.TrainConfig):
@@ -213,6 +237,15 @@ def main(config: _config.TrainConfig):
     jax.distributed.initialize()
 
     is_main_process = jax.process_index() == 0
+
+    if config.unique_run_id and jax.process_count() > 1:
+        suffix_bytes = np.array(list(config._run_id_suffix.encode()), dtype=np.uint8)
+        suffix_bytes = jax.experimental.multihost_utils.broadcast_one_to_all(suffix_bytes)
+        synced_suffix = bytes(np.array(suffix_bytes, dtype=np.uint8)).decode()
+        if config._run_id_suffix != synced_suffix:
+            logging.info(f"Synced run_id_suffix: {config._run_id_suffix} -> {synced_suffix}")
+            object.__setattr__(config, "_run_id_suffix", synced_suffix)
+
     logging.info(
         f"Running on: {platform.node()}, process {jax.process_index()}/{jax.process_count()}, "
         f"{jax.local_device_count()} local / {jax.device_count()} total devices"
@@ -240,23 +273,32 @@ def main(config: _config.TrainConfig):
     )
     init_wandb(config, resuming=resuming, enabled=config.wandb_enabled and is_main_process)
 
-    train_loader, val_loader = _data_loader.create_train_val_data_loaders(
-        config,
-        sharding=data_sharding,
-    )
+    # Goal-conditioned models (Pi0CRL, Pi0SF) train on HER-style dict batches from
+    # rl_data_loader; everything else uses the standard supervised loader.
+    if config.model.requires_goal_data:
+        train_loader, val_loader = _rl_data_loader.create_train_val_goal_conditioned_data_loaders(
+            config,
+            sharding=data_sharding,
+        )
+    else:
+        train_loader, val_loader = _data_loader.create_train_val_data_loaders(
+            config,
+            sharding=data_sharding,
+        )
     data_iter = iter(train_loader)
     val_iter = iter(val_loader) if val_loader is not None else None
     logging.info("About to fetch first batch from data loader...")
     t0 = time.time()
-    batch = next(data_iter)
+    batch = _as_batch_dict(next(data_iter))
     t1 = time.time()
     logging.info("Fetched first batch in %.3f s", t1 - t0)
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
 
     if is_main_process:
+        obs_images = batch["observation"].images
         images_to_log = [
-            wandb.Image(np.concatenate([np.array(img[i]) for img in batch[0].images.values()], axis=1))
-            for i in range(min(5, len(next(iter(batch[0].images.values())))))
+            wandb.Image(np.concatenate([np.array(img[i]) for img in obs_images.values()], axis=1))
+            for i in range(min(5, len(next(iter(obs_images.values())))))
         ]
         wandb.log({"camera_views": images_to_log}, step=0)
 
@@ -274,11 +316,15 @@ def main(config: _config.TrainConfig):
         donate_argnums=(1,),
     )
 
-    pval_step = jax.jit(
-        val_step,
-        in_shardings=(train_state_sharding, replicated_sharding, data_sharding),
-        out_shardings=replicated_sharding,
-    ) if val_loader is not None else None
+    pval_step = (
+        jax.jit(
+            val_step,
+            in_shardings=(train_state_sharding, replicated_sharding, data_sharding),
+            out_shardings=replicated_sharding,
+        )
+        if val_loader is not None
+        else None
+    )
 
     start_step = int(train_state.step)
     pbar = tqdm.tqdm(
@@ -302,13 +348,13 @@ def main(config: _config.TrainConfig):
                 pbar.write(f"Step {step}: {info_str}")
                 wandb.log(reduced_info, step=step)
             infos = []
-        batch = next(data_iter)
+        batch = _as_batch_dict(next(data_iter))
 
         if pval_step is not None and val_iter is not None and step % config.val_interval == 0:
             val_rng = jax.random.fold_in(train_rng, step)
             val_infos = []
             for _ in range(config.val_batches):
-                val_batch = next(val_iter)
+                val_batch = _as_batch_dict(next(val_iter))
                 with sharding.set_mesh(mesh):
                     vi = pval_step(train_state, val_rng, val_batch)
                 val_infos.append(vi)

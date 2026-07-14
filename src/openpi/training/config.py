@@ -112,6 +112,15 @@ class DataConfig:
     include_next_observation: bool = True
     include_future_observation: bool = True
     include_goal_observation: bool = True
+    # When True, the goal-conditioned loader also samples an explicit within-task negative per
+    # anchor (uniform over frames sharing the anchor's task) as a hard CRL contrastive negative.
+    include_negative_observation: bool = False
+    # Diagnostic (randomization test, Zhang et al. 2017): replace the CRL positive
+    # (future_observation) with a FIXED random frame from a different episode — deterministic per
+    # anchor index, stable across epochs, so the pairing is memorizable but semantically empty.
+    # Any train rep_loss below chance (~ln batch_size) is pure memorization capacity; val should
+    # stay at chance. Never enable for real training.
+    random_future_control: bool = False
 
 
 class GroupFactory(Protocol):
@@ -957,14 +966,14 @@ _CONFIGS = [
         # For fine-tuning on your own DROID dataset, see below.
         name="pi05_crl_droid_finetune",
         project_name="VLA-FB",
-        model=pi0_config.Pi0RepConfig(
+        model=pi0_config.Pi0CRLConfig(
             pi05=True,
             action_dim=32,
             action_horizon=16,
             paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m",
         ),
-        freeze_filter=pi0_config.Pi0RepConfig(
+        freeze_filter=pi0_config.Pi0CRLConfig(
             pi05=True,
             action_dim=32,
             action_horizon=16,
@@ -1001,14 +1010,14 @@ _CONFIGS = [
         # We use RLDS data loading to make training on this large dataset tractable.
         # For fine-tuning on your own DROID dataset, see below.
         name="pi05_100_droid_finetune",
-        model=pi0_config.Pi0RepConfig(
+        model=pi0_config.Pi0CRLConfig(
             pi05=True,
             action_dim=32,
             action_horizon=16,
             paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m",
         ),
-        freeze_filter=pi0_config.Pi0RepConfig(
+        freeze_filter=pi0_config.Pi0CRLConfig(
             pi05=True,
             action_dim=32,
             action_horizon=16,
@@ -1102,9 +1111,8 @@ _CONFIGS = [
         log_interval=100,
         save_interval=5000,
         keep_period=10_000,
-        # SF's compute_loss requires next_* (SARSA a'); the validation step doesn't provide them,
-        # so disable the val split for SF training.
-        val_fraction=0.0,
+        # Val is supported: the RLDS goal-conditioned loader provides next_* (SARSA a') for
+        # every split, and val_step forwards the full batch dict to SF's compute_loss.
         num_workers=0,  # Important: RLDS DataLoader requires num_workers=0, handles multi-processing internally
     ),
     TrainConfig(
@@ -1112,7 +1120,7 @@ _CONFIGS = [
         # This is the non-LoRA counterpart to `pi05_100_droid_finetune` and is
         # intended to fit on a single node with 8x64GB GPUs.
         name="pi05_100_droid_full_finetune_8",
-        model=pi0_config.Pi0RepConfig(
+        model=pi0_config.Pi0CRLConfig(
             pi05=True,
             action_dim=32,
             action_horizon=16,
@@ -1174,13 +1182,13 @@ _CONFIGS = [
         # We use RLDS data loading to make training on this large dataset tractable.
         # For fine-tuning on your own DROID dataset, see below.
         name="pi05_crl_libero_finetune",
-        model=pi0_config.Pi0RepConfig(
+        model=pi0_config.Pi0CRLConfig(
             pi05=True,
             action_horizon=16,
             paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m",
         ),
-        freeze_filter=pi0_config.Pi0RepConfig(
+        freeze_filter=pi0_config.Pi0CRLConfig(
             pi05=True,
             action_horizon=16,
             paligemma_variant="gemma_2b_lora",
@@ -1208,7 +1216,7 @@ _CONFIGS = [
 
     TrainConfig(
         name="pi05_crl_libero_full_finetune",
-        model=pi0_config.Pi0RepConfig(
+        model=pi0_config.Pi0CRLConfig(
             pi05=True,
             action_horizon=10,
             discrete_state_input=False,
@@ -1232,8 +1240,145 @@ _CONFIGS = [
     ),
 
     TrainConfig(
+        # Pure representation learning on a frozen backbone: rep_dim=2048 phi/psi heads,
+        # action loss off and no rep-loss leak into the backbone (action_loss_coeff=0.0,
+        # rep_backbone_grad_scale=0.0). backbone_frozen is True, so only the phi/psi heads
+        # train — the backbone's backward pass and optimizer state are skipped. The
+        # freeze_filter builder mirrors those coeffs so the freeze actually takes effect.
+        name="pi05_crl_libero_full_finetune_frozen",
+        model=pi0_config.Pi0CRLConfig(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            rep_dim=2048,
+            action_loss_coeff=0.0,
+            rep_backbone_grad_scale=0.0,
+            # Regularizers to close the train<<val rep-loss gap: dropout in the phi/psi heads,
+            # plus L2-norm + learnable temperature on the reps (on by default in Pi0CRLConfig).
+            rep_head_dropout=0.1,
+        ),
+        # rep_head_dropout / temperature / logsumexp_penalty_coeff do not affect backbone_frozen
+        # or the freeze regex, so the freeze_filter mirror below intentionally omits them.
+        freeze_filter=pi0_config.Pi0CRLConfig(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            rep_dim=2048,
+            action_loss_coeff=0.0,
+            rep_backbone_grad_scale=0.0,
+        ).get_freeze_filter(),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True, include_negative_observation=True),
+            extra_delta_transform=False,
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_libero/params"),
+        num_train_steps=30_000,
+    ),
+
+    TrainConfig(
+        # Leaner-head variant of ..._frozen to test whether the train<<val rep gap is head
+        # over-capacity (memorization) rather than the same-episode collision artifact — the
+        # masked-vs-nomask diagnostic showed collisions explain only ~20% of the gap. Two
+        # capacity cuts vs the baseline: rep_dim 2048 -> 512 and rep_head_depth 2 -> 1 (halves
+        # the gemma blocks per head, also speeds up). Dropout stays at 0.1 so this isolates
+        # capacity. rep_dim / rep_head_depth don't affect backbone_frozen or the freeze regex,
+        # so the freeze_filter builder below only needs to mirror the two freeze-affecting coeffs.
+        name="pi05_crl_libero_full_finetune_frozen_lite",
+        model=pi0_config.Pi0CRLConfig(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            rep_dim=512,
+            rep_head_depth=1,
+            action_loss_coeff=0.0,
+            rep_backbone_grad_scale=0.0,
+            rep_head_dropout=0.1,
+        ),
+        freeze_filter=pi0_config.Pi0CRLConfig(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            action_loss_coeff=0.0,
+            rep_backbone_grad_scale=0.0,
+        ).get_freeze_filter(),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True, include_negative_observation=True),
+            extra_delta_transform=False,
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_libero/params"),
+        num_train_steps=30_000,
+    ),
+
+    TrainConfig(
+        # Randomization test (Zhang et al. 2017) on the frozen_lite setup: identical model/optimizer,
+        # but the CRL positive is a FIXED random cross-episode frame (random_future_control=True),
+        # so the pairing is memorizable yet semantically empty. Read-out: train rep_loss sinking
+        # below chance (≈ ln(batch_size)) measures pure pairing-memorization capacity of the head;
+        # val rep_loss should pin at chance. Compare the train curve against the real frozen_lite
+        # run to calibrate how much of its train/val gap is memorization.
+        name="pi05_crl_libero_full_finetune_frozen_lite_randfuture",
+        model=pi0_config.Pi0CRLConfig(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            rep_dim=512,
+            rep_head_depth=1,
+            action_loss_coeff=0.0,
+            rep_backbone_grad_scale=0.0,
+            rep_head_dropout=0.1,
+        ),
+        freeze_filter=pi0_config.Pi0CRLConfig(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            action_loss_coeff=0.0,
+            rep_backbone_grad_scale=0.0,
+        ).get_freeze_filter(),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                include_negative_observation=True,
+                random_future_control=True,
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_libero/params"),
+        num_train_steps=30_000,
+    ),
+
+    TrainConfig(
         name="pi05_crl_libero_full_finetune_pretrained",
-        model=pi0_config.Pi0RepConfig(
+        model=pi0_config.Pi0CRLConfig(
             pi05=True,
             action_horizon=10,
             discrete_state_input=False,
@@ -1258,10 +1403,10 @@ _CONFIGS = [
 
     # phi_input="state" variants: phi joins psi on the prefix, so both CRL reps
     # are action-independent. Checkpoints are NOT weight-compatible with the
-    # default (suffix-phi) configs above — phi_token/phi_proj widths differ.
+    # default (suffix-phi) configs above — phi_head/phi_proj widths differ.
     TrainConfig(
         name="pi05_crl_libero_full_finetune_state_phi",
-        model=pi0_config.Pi0RepConfig(
+        model=pi0_config.Pi0CRLConfig(
             pi05=True,
             action_horizon=10,
             discrete_state_input=False,
@@ -1287,7 +1432,7 @@ _CONFIGS = [
 
     TrainConfig(
         name="pi05_crl_libero_full_finetune_pretrained_state_phi",
-        model=pi0_config.Pi0RepConfig(
+        model=pi0_config.Pi0CRLConfig(
             pi05=True,
             action_horizon=10,
             discrete_state_input=False,
