@@ -447,12 +447,16 @@ class Pi0(_model.BaseModel):
         train: bool = False,
         episode_id: at.Int[at.Array, " b"] | None = None,
         negative_observation: _model.Observation | None = None,
+        next_observation: _model.Observation | None = None,
+        goal_observation: _model.Observation | None = None,
+        ranking_indices: dict[str, at.Array] | None = None,
     ) -> at.Float[at.Array, "*b ah"]:
-        preprocess_rng, future_preprocess_rng, negative_preprocess_rng, noise_rng, time_rng, dropout_rng = (
+        preprocess_rng, future_preprocess_rng, aux_preprocess_rng, noise_rng, time_rng, dropout_rng = (
             jax.random.split(rng, 6)
         )
+        negative_preprocess_rng, next_preprocess_rng, goal_preprocess_rng = jax.random.split(aux_preprocess_rng, 3)
         # Independent head-dropout keys per rep (only used when train=True).
-        phi_drop_rng, psi_drop_rng, neg_drop_rng = jax.random.split(dropout_rng, 3)
+        phi_drop_rng, psi_drop_rng, neg_drop_rng, rank_drop_rng = jax.random.split(dropout_rng, 4)
         deterministic = not train
         # Augment each contrastive view independently — a shared key would apply the
         # identical crop/rotation/jitter to each anchor/future pair, letting the model match
@@ -460,15 +464,20 @@ class Pi0(_model.BaseModel):
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
         future_observation = _model.preprocess_observation(future_preprocess_rng, future_observation, train=train)
 
-        # Stack current + future (+ optional explicit within-task negative) for one forward pass.
-        # Actions are duplicated for the future/negative halves — those suffixes are discarded, so
-        # the duplicated actions never enter the action loss.
+        # Stack current + future (+ optional within-task negative, + optional next/goal for the
+        # val ranking probe) for one forward pass. `slots` records each view's position in the
+        # stack. Actions are duplicated for the non-current views — those suffixes are discarded,
+        # so the duplicated actions never enter the action loss.
         obs_group = [observation, future_observation]
-        if negative_observation is not None:
-            negative_observation = _model.preprocess_observation(
-                negative_preprocess_rng, negative_observation, train=train
-            )
-            obs_group.append(negative_observation)
+        slots = {"future": 1}
+        for name, obs, obs_rng in (
+            ("negative", negative_observation, negative_preprocess_rng),
+            ("next", next_observation, next_preprocess_rng),
+            ("goal", goal_observation, goal_preprocess_rng),
+        ):
+            if obs is not None:
+                slots[name] = len(obs_group)
+                obs_group.append(_model.preprocess_observation(obs_rng, obs, train=train))
         observation_stacked = jax.tree_util.tree_map(
             lambda *xs: jnp.concatenate(xs, axis=0), *obs_group
         )
@@ -498,11 +507,19 @@ class Pi0(_model.BaseModel):
         # CRL reps via dedicated heads over a learned layer-mix. psi always reads a prefix
         # (state-only); phi reads the current prefix (state mode) or current suffix
         # (state_action mode). Layer axis is 0, so slice batch on axis 1. The stack is
-        # [current | future | (negative)], so slices are [:B], [B:2B], [2B:3B].
+        # [current | future | ...slots], so view k occupies [k*B:(k+1)*B].
         B = orig_batch_size
-        psi_raw = self._psi_from_prefix(
-            prefix_hidden[:, B : 2 * B], prefix_mask[B : 2 * B], deterministic=deterministic, dropout_rng=psi_drop_rng
-        )  # (B, d)
+
+        def _psi_slot(name, drop_rng):
+            k = slots[name]
+            return self._psi_from_prefix(
+                prefix_hidden[:, k * B : (k + 1) * B],
+                prefix_mask[k * B : (k + 1) * B],
+                deterministic=deterministic,
+                dropout_rng=drop_rng,
+            )  # (B, d)
+
+        psi_raw = _psi_slot("future", psi_drop_rng)
         if self._phi_on_prefix:
             phi_raw = self._phi_from_prefix(
                 prefix_hidden[:, :B], prefix_mask[:B], deterministic=deterministic, dropout_rng=phi_drop_rng
@@ -535,13 +552,7 @@ class Pi0(_model.BaseModel):
         # (mostly cross-task) in-batch negatives keeps the InfoNCE denominator a valid mixture
         # reference while forcing phi/psi to discriminate states *within* a task.
         if negative_observation is not None:
-            psi_neg_raw = self._psi_from_prefix(
-                prefix_hidden[:, 2 * B : 3 * B],
-                prefix_mask[2 * B : 3 * B],
-                deterministic=deterministic,
-                dropout_rng=neg_drop_rng,
-            )  # (B, d)
-            psi_neg_raw = psi_neg_raw.astype(jnp.float32)
+            psi_neg_raw = _psi_slot("negative", neg_drop_rng).astype(jnp.float32)
             psi_neg = psi_neg_raw / (jnp.linalg.norm(psi_neg_raw, axis=-1, keepdims=True) + eps)
             crl_self_neg = logit_scale * jnp.sum(phi_flat * psi_neg, axis=-1)  # (B,): [j] = <phi_j, psi_neg_j>
             over_psi_logits = jnp.concatenate([crl_matrix, crl_self_neg[None, :]], axis=0)  # (B+1, B)
@@ -605,6 +616,83 @@ class Pi0(_model.BaseModel):
             )
             # Unmasked InfoNCE (no penalty) as the apples-to-apples reference for rep_loss_masked.
             diagnostics["rep_loss_nomask"] = crl_infonce
+
+        if ranking_indices is not None and episode_id is not None:
+            # Val ranking probe (compute-only, NOT in total_loss). The batch's own draws give up
+            # to 4 same-episode future candidates at KNOWN offsets (next, future, goal, and the
+            # negative when it lands in the anchor's future) plus non-future candidates (negative
+            # landing in the past / another episode). Two capabilities, measured directly:
+            #   (a) rank_order_*: temporally NEARER same-episode futures must outscore farther
+            #       ones (occupancy decays geometrically with offset). Scene fingerprints are
+            #       constant within an episode, so this is shortcut-proof progress measurement.
+            #   (b) rank_neg_*: any same-episode future must outscore zero-occupancy candidates
+            #       (same-episode past/current frames, other-episode frames).
+            # Unlike raw val InfoNCE, none of this depends on batch composition or collisions.
+            anchor_idx = ranking_indices["frame_index"].astype(jnp.int32)
+            next_drop_rng, goal_drop_rng = jax.random.split(rank_drop_rng)
+
+            def _rank_cos(name, drop_rng):
+                r = _psi_slot(name, drop_rng).astype(jnp.float32)
+                r = r / (jnp.linalg.norm(r, axis=-1, keepdims=True) + eps)
+                return jnp.sum(phi_flat * r, axis=-1)  # (B,) cosine score against the anchor
+
+            # Candidate lists: score, temporal offset (frames), and validity as a future candidate.
+            cand_scores = [jnp.sum(phi_flat * psi_flat, axis=-1)]
+            cand_offsets = [ranking_indices["future_frame_index"].astype(jnp.int32) - anchor_idx]
+            # future_episode_id differs from episode_id only in random_future_control mode.
+            cand_valid = [
+                ~ranking_indices["future_is_pad"] & (ranking_indices["future_episode_id"] == episode_id)
+            ]
+            if "next" in slots:
+                cand_scores.append(_rank_cos("next", next_drop_rng))
+                cand_offsets.append(ranking_indices["next_frame_index"].astype(jnp.int32) - anchor_idx)
+                cand_valid.append(~ranking_indices["next_is_pad"])
+            if "goal" in slots:
+                cand_scores.append(_rank_cos("goal", goal_drop_rng))
+                cand_offsets.append(ranking_indices["goal_frame_index"].astype(jnp.int32) - anchor_idx)
+                cand_valid.append(~ranking_indices["goal_is_pad"])
+            neg_same_ep = neg_nonfuture_past = None
+            if crl_self_neg is not None:
+                d_neg = ranking_indices["negative_frame_index"].astype(jnp.int32) - anchor_idx
+                neg_same_ep = ranking_indices["negative_episode_id"] == episode_id
+                s_neg_cos = jnp.sum(phi_flat * psi_neg, axis=-1)
+                # A same-episode strict-future negative joins the ordering candidates (last row).
+                cand_scores.append(s_neg_cos)
+                cand_offsets.append(d_neg)
+                cand_valid.append(neg_same_ep & (d_neg > 0))
+                neg_nonfuture_past = neg_same_ep & (d_neg <= 0)
+
+            S = jnp.stack(cand_scores)  # (K, B)
+            D = jnp.stack(cand_offsets)  # (K, B)
+            V = jnp.stack(cand_valid)  # (K, B)
+
+            def _safe_mean(x, mask):
+                mask = mask.astype(jnp.float32)
+                return jnp.sum(x * mask) / jnp.maximum(jnp.sum(mask), 1.0)
+
+            # (a) ordering accuracy over candidate pairs, each counted once (i < j).
+            once = jnp.tril(jnp.ones((S.shape[0], S.shape[0]), dtype=bool), k=-1)[..., None]
+            margin = jnp.where(D[:, None] < D[None, :], S[:, None] - S[None, :], S[None, :] - S[:, None])
+            pair_valid = V[:, None] & V[None, :] & (D[:, None] != D[None, :]) & once
+            diagnostics["rank_order_acc"] = _safe_mean((margin > 0).astype(jnp.float32), pair_valid)
+            diagnostics["rank_order_margin"] = _safe_mean(margin, pair_valid)
+            diagnostics["rank_order_pairs"] = jnp.sum(pair_valid) / B
+            rank_losses = [(jax.nn.softplus(-logit_scale * margin), pair_valid)]
+
+            # (b) future candidates vs the negative when it is a zero-occupancy (non-future) frame.
+            if crl_self_neg is not None:
+                fut_vs_neg = S[:-1] - s_neg_cos[None, :]  # (K-1, B); last row is the neg itself
+                for tag, cond in (("rank_neg_other", ~neg_same_ep), ("rank_neg_past", neg_nonfuture_past)):
+                    valid = V[:-1] & cond[None, :]
+                    diagnostics[f"{tag}_acc"] = _safe_mean((fut_vs_neg > 0).astype(jnp.float32), valid)
+                    diagnostics[f"{tag}_pairs"] = jnp.sum(valid) / B
+                    rank_losses.append((jax.nn.softplus(-logit_scale * fut_vs_neg), valid))
+
+            # Aggregate pairwise logistic ranking loss (same logit scale as the InfoNCE, so the
+            # units are comparable to rep_loss; 0 = every comparison correctly ordered w/ margin).
+            total_l = sum(jnp.sum(loss * v.astype(jnp.float32)) for loss, v in rank_losses)
+            total_n = sum(jnp.sum(v) for _, v in rank_losses)
+            diagnostics["ranking_loss"] = total_l / jnp.maximum(total_n.astype(jnp.float32), 1.0)
 
         total_loss = self.action_loss_coeff * action_loss + self.crl_loss_coeff * crl_loss
         return total_loss, {"action_loss": action_loss, "rep_loss": crl_loss, **diagnostics}

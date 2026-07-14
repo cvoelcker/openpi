@@ -60,6 +60,15 @@ class GoalConditionedBatch(TypedDict, total=False):
     goal_is_pad: at.Array
     # Per-sample episode identifier (the anchor frame's episode).
     episode_id: at.Array
+    # Absolute frame indices of the drawn frames (for temporal-offset diagnostics such as the
+    # val ranking probe), plus episode ids for frames that may leave the anchor's episode.
+    frame_index: at.Array
+    next_frame_index: at.Array
+    future_frame_index: at.Array
+    future_episode_id: at.Array
+    goal_frame_index: at.Array
+    negative_frame_index: at.Array
+    negative_episode_id: at.Array
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +140,7 @@ class RandomFutureDataset(_data_loader.Dataset):
         include_future_observation: bool = True,
         include_goal_observation: bool = True,
         include_negative_observation: bool = False,
+        random_future_control: bool = False,
         frame_task: np.ndarray | None = None,
         task_to_frames: dict[int, np.ndarray] | None = None,
     ):
@@ -143,6 +153,7 @@ class RandomFutureDataset(_data_loader.Dataset):
         self._include_future = include_future_observation
         self._include_goal = include_goal_observation
         self._include_negative = include_negative_observation
+        self._random_future_control = random_future_control
         if include_negative_observation and (frame_task is None or task_to_frames is None):
             raise ValueError("include_negative_observation=True requires frame_task and task_to_frames.")
         self._frame_task = frame_task
@@ -180,6 +191,20 @@ class RandomFutureDataset(_data_loader.Dataset):
         u = rng.random()
         k = int(np.ceil(np.log1p(-u * cdf_max) / np.log(g)))
         return min(max(k, 1), max_chunks)
+
+    def _control_future_index(self, t: int) -> int:
+        """Randomization-test positive: a random frame from a DIFFERENT episode, deterministic in
+        the anchor index (stable across epochs/workers) so the pairing is memorizable but carries
+        no temporal signal. Uniform over all out-of-episode frames via index remapping (no
+        rejection loop). Falls back to t itself for a degenerate single-episode dataset."""
+        ep_start, ep_end = int(self._ep_start[t]), int(self._ep_end[t])
+        num_valid = len(self._dataset) - (ep_end - ep_start)
+        if num_valid <= 0:
+            return t
+        # Salted, anchor-keyed RNG: independent of the per-worker sampling stream.
+        rng = np.random.default_rng([self._sampling.seed, 0x5EED, t])
+        u = int(rng.integers(0, num_valid))
+        return u if u < ep_start else u + (ep_end - ep_start)
 
     def _sample_indices(self, t: int) -> tuple[int, int, int, dict[str, np.bool_]]:
         ep_end = int(self._ep_end[t])
@@ -219,6 +244,11 @@ class RandomFutureDataset(_data_loader.Dataset):
     def __getitem__(self, index) -> dict:
         t = int(index)
         next_idx, future_idx, goal_idx, pads = self._sample_indices(t)
+        if self._random_future_control:
+            # Override only the CRL positive; next/goal/negative keep their real semantics. A
+            # cross-episode partner always exists, so the future is never a boundary-clamped pad.
+            future_idx = self._control_future_index(t)
+            pads["future_is_pad"] = np.bool_(future_idx == t)
 
         anchor = self._dataset[t]
         actions = anchor.get("actions")
@@ -227,23 +257,36 @@ class RandomFutureDataset(_data_loader.Dataset):
             return {k: v for k, v in sample.items() if k != "actions"}
 
         # The episode-start frame index uniquely identifies the anchor's episode; equal
-        # values mean same episode.
-        item = {"observation": _obs_only(anchor), "episode_id": np.int64(self._ep_start[t])}
+        # values mean same episode. Absolute frame indices for every drawn frame are also
+        # emitted so downstream diagnostics (e.g. the val ranking probe) can reconstruct
+        # temporal offsets and same-episode relations without re-touching the dataset.
+        item = {
+            "observation": _obs_only(anchor),
+            "episode_id": np.int64(self._ep_start[t]),
+            "frame_index": np.int64(t),
+        }
         if self._include_next:
             item["next_observation"] = _obs_only(self._dataset[next_idx])
             item["next_is_pad"] = pads["next_is_pad"]
+            item["next_frame_index"] = np.int64(next_idx)
         if self._include_future:
             item["future_observation"] = _obs_only(self._dataset[future_idx])
             item["future_is_pad"] = pads["future_is_pad"]
+            item["future_frame_index"] = np.int64(future_idx)
+            # Same as episode_id except in random_future_control mode (cross-episode positive).
+            item["future_episode_id"] = np.int64(self._ep_start[future_idx])
         if self._include_goal:
             item["goal_observation"] = _obs_only(self._dataset[goal_idx])
             item["goal_is_pad"] = pads["goal_is_pad"]
+            item["goal_frame_index"] = np.int64(goal_idx)
         if self._include_negative:
             # Explicit within-task negative: uniform over all frames sharing the anchor's task,
             # deliberately unbiased (may land on the anchor's own trajectory).
             same_task_frames = self._task_to_frames[int(self._frame_task[t])]
             neg_idx = int(same_task_frames[self._rng().integers(0, len(same_task_frames))])
             item["negative_observation"] = _obs_only(self._dataset[neg_idx])
+            item["negative_frame_index"] = np.int64(neg_idx)
+            item["negative_episode_id"] = np.int64(self._ep_start[neg_idx])
         if actions is not None:
             item["actions"] = actions
         return item
@@ -265,7 +308,19 @@ class GoalConditionedDataLoader(_data_loader.DataLoader):
             for key in ("next_observation", "future_observation", "goal_observation", "negative_observation"):
                 if key in batch:
                     out[key] = _model.Observation.from_dict(batch[key])
-            for key in ("next_is_pad", "future_is_pad", "goal_is_pad", "episode_id"):
+            for key in (
+                "next_is_pad",
+                "future_is_pad",
+                "goal_is_pad",
+                "episode_id",
+                "frame_index",
+                "next_frame_index",
+                "future_frame_index",
+                "future_episode_id",
+                "goal_frame_index",
+                "negative_frame_index",
+                "negative_episode_id",
+            ):
                 if key in batch:
                     out[key] = batch[key]
             if "actions" in batch:
@@ -416,6 +471,7 @@ def create_goal_conditioned_data_loader(
         include_future_observation=data_config.include_future_observation,
         include_goal_observation=data_config.include_goal_observation,
         include_negative_observation=data_config.include_negative_observation,
+        random_future_control=data_config.random_future_control,
         frame_task=frame_task,
         task_to_frames=task_to_frames,
     )
@@ -506,6 +562,7 @@ def create_train_val_goal_conditioned_data_loaders(
             include_future_observation=data_config.include_future_observation,
             include_goal_observation=data_config.include_goal_observation,
             include_negative_observation=data_config.include_negative_observation,
+            random_future_control=data_config.random_future_control,
             frame_task=frame_task,
             task_to_frames=split_task_to_frames,
         )
@@ -545,6 +602,9 @@ def _create_goal_conditioned_rlds_data_loader(
     shuffle buffer.
     """
     from openpi.training.droid_rlds_dataset import DroidRldsDataset
+
+    if data_config.random_future_control:
+        raise NotImplementedError("random_future_control is only implemented for the LeRobot path.")
 
     local_batch_size = config.batch_size // jax.process_count()
     logger.info(f"RLDS local_batch_size: {local_batch_size}")

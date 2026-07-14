@@ -246,6 +246,26 @@ def val_step(
     episode_id = batch.get("episode_id")
     negative_observation = batch.get("negative_observation")
 
+    # Val ranking probe: score the batch's own next/goal/negative draws against the anchor and
+    # check temporal ordering (see compute_loss). Needs the frame indices from the data loader;
+    # older cached loaders without them just skip the probe.
+    do_ranking = "frame_index" in batch and "future_episode_id" in batch and episode_id is not None
+    ranking_keys = (
+        "frame_index",
+        "next_frame_index",
+        "next_is_pad",
+        "future_frame_index",
+        "future_is_pad",
+        "future_episode_id",
+        "goal_frame_index",
+        "goal_is_pad",
+        "negative_frame_index",
+        "negative_episode_id",
+    )
+    ranking_indices = {k: batch[k] for k in ranking_keys if k in batch} if do_ranking else None
+    next_observation = batch.get("next_observation") if do_ranking else None
+    goal_observation = batch.get("goal_observation") if do_ranking else None
+
     chunked_loss, log_dict = model.compute_loss(
         rng,
         observation,
@@ -254,6 +274,9 @@ def val_step(
         train=False,
         episode_id=episode_id,
         negative_observation=negative_observation,
+        next_observation=next_observation,
+        goal_observation=goal_observation,
+        ranking_indices=ranking_indices,
     )
     # Same keys as train (action_loss, rep_loss, rep diagnostics incl. per-split collision_rate),
     # prefixed val/ and meaned. Comparing train vs val collision_rate surfaces the val-loader

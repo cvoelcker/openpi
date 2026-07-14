@@ -115,6 +115,12 @@ class DataConfig:
     # When True, the goal-conditioned loader also samples an explicit within-task negative per
     # anchor (uniform over frames sharing the anchor's task) as a hard CRL contrastive negative.
     include_negative_observation: bool = False
+    # Diagnostic (randomization test, Zhang et al. 2017): replace the CRL positive
+    # (future_observation) with a FIXED random frame from a different episode — deterministic per
+    # anchor index, stable across epochs, so the pairing is memorizable but semantically empty.
+    # Any train rep_loss below chance (~ln batch_size) is pure memorization capacity; val should
+    # stay at chance. Never enable for real training.
+    random_future_control: bool = False
 
 
 class GroupFactory(Protocol):
@@ -1241,6 +1247,53 @@ _CONFIGS = [
         data=LeRobotLiberoDataConfig(
             repo_id="physical-intelligence/libero",
             base_config=DataConfig(prompt_from_task=True, include_negative_observation=True),
+            extra_delta_transform=False,
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_libero/params"),
+        num_train_steps=30_000,
+    ),
+
+    TrainConfig(
+        # Randomization test (Zhang et al. 2017) on the frozen_lite setup: identical model/optimizer,
+        # but the CRL positive is a FIXED random cross-episode frame (random_future_control=True),
+        # so the pairing is memorizable yet semantically empty. Read-out: train rep_loss sinking
+        # below chance (≈ ln(batch_size)) measures pure pairing-memorization capacity of the head;
+        # val rep_loss should pin at chance. Compare the train curve against the real frozen_lite
+        # run to calibrate how much of its train/val gap is memorization.
+        name="pi05_crl_libero_full_finetune_frozen_lite_randfuture",
+        model=pi0_config.Pi0RepConfig(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            rep_dim=512,
+            rep_head_depth=1,
+            action_loss_coeff=0.0,
+            rep_backbone_grad_scale=0.0,
+            rep_head_dropout=0.1,
+        ),
+        freeze_filter=pi0_config.Pi0RepConfig(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            action_loss_coeff=0.0,
+            rep_backbone_grad_scale=0.0,
+        ).get_freeze_filter(),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                include_negative_observation=True,
+                random_future_control=True,
+            ),
             extra_delta_transform=False,
         ),
         batch_size=256,

@@ -52,7 +52,14 @@ def _bounds_from_episodes(episodes: list[tuple[int, int]]) -> tuple[np.ndarray, 
 
 
 def _make_dataset(
-    episodes, *, gamma=0.9, future_gamma=0.9, seed=0, action_chunk_size=1, include_negative_observation=False
+    episodes,
+    *,
+    gamma=0.9,
+    future_gamma=0.9,
+    seed=0,
+    action_chunk_size=1,
+    include_negative_observation=False,
+    random_future_control=False,
 ) -> _rl.RandomFutureDataset:
     ep_start, ep_end = _bounds_from_episodes(episodes)
     num_frames = len(ep_start)
@@ -68,6 +75,7 @@ def _make_dataset(
         sampling=_rl.GoalSamplingConfig(gamma=gamma, future_gamma=future_gamma, seed=seed),
         action_chunk_size=action_chunk_size,
         include_negative_observation=include_negative_observation,
+        random_future_control=random_future_control,
         frame_task=frame_task,
         task_to_frames=task_to_frames,
     )
@@ -190,6 +198,46 @@ def test_within_task_negative_structure_and_sampling():
     assert min(neg_frames) < 5 and max(neg_frames) >= 5
 
 
+def test_random_future_control_pairing():
+    """Randomization-test mode: the CRL positive must be (a) from a different episode, (b) a FIXED
+    partner per anchor across repeated fetches/epochs (else it cannot be memorized and the control
+    is vacuous), and (c) never flagged as pad. Other keys keep their real semantics."""
+    episodes = [(0, 5), (5, 10), (10, 15)]
+    ds = _make_dataset(episodes, random_future_control=True)
+    ep_start, _ = _bounds_from_episodes(episodes)
+
+    for t in range(15):
+        partners = {int(ds[t]["future_observation"]["state"][0]) for _ in range(20)}
+        assert len(partners) == 1, f"pairing not fixed across epochs for t={t}: {partners}"
+        partner = partners.pop()
+        assert ep_start[partner] != ep_start[t], f"partner shares anchor's episode: t={t}"
+        assert not bool(ds[t]["future_is_pad"])
+        # next/goal keep real (within-episode) semantics.
+        assert ep_start[int(ds[t]["next_observation"]["state"][0])] == ep_start[t]
+        assert ep_start[int(ds[t]["goal_observation"]["state"][0])] == ep_start[t]
+
+    # The pairing is a pure function of (seed, anchor) — identical across dataset instances...
+    ds_b = _make_dataset(episodes, random_future_control=True)
+    assert all(
+        int(ds[t]["future_observation"]["state"][0]) == int(ds_b[t]["future_observation"]["state"][0])
+        for t in range(15)
+    )
+    # ...and changes with the seed (not a constant mapping).
+    ds_c = _make_dataset(episodes, random_future_control=True, seed=1)
+    assert any(
+        int(ds[t]["future_observation"]["state"][0]) != int(ds_c[t]["future_observation"]["state"][0])
+        for t in range(15)
+    )
+
+
+def test_random_future_control_single_episode_fallback():
+    # Degenerate dataset with no cross-episode partner: falls back to t and flags pad.
+    ds = _make_dataset([(0, 5)], random_future_control=True)
+    item = ds[2]
+    assert int(item["future_observation"]["state"][0]) == 2
+    assert bool(item["future_is_pad"])
+
+
 def test_sampling_is_seeded_deterministic():
     episodes = [(0, 10)]
     ds_a = _make_dataset(episodes, seed=123)
@@ -211,11 +259,32 @@ def test_item_structure_strips_aux_actions():
         "future_is_pad",
         "goal_is_pad",
         "actions",
+        "episode_id",
+        "frame_index",
+        "next_frame_index",
+        "future_frame_index",
+        "future_episode_id",
+        "goal_frame_index",
     }
     # Auxiliary frames should not carry the (redundant) action chunk.
     for key in ["observation", "next_observation", "future_observation", "goal_observation"]:
         assert "actions" not in item[key]
     assert item["actions"].shape == (ACTION_HORIZON, ACTION_DIM)
+
+
+def test_frame_indices_match_fetched_frames():
+    """The emitted *_frame_index keys must agree with the frames actually fetched (whose state
+    fields encode their index in the fake dataset), and episode ids must be the episode starts."""
+    ds = _make_dataset([(0, 5), (5, 10)], include_negative_observation=True)
+    for t in [0, 2, 6]:
+        item = ds[t]
+        assert int(item["frame_index"]) == t
+        assert int(item["episode_id"]) == (0 if t < 5 else 5)
+        for name in ("next", "future", "goal", "negative"):
+            idx = int(item[f"{name}_frame_index"])
+            assert int(item[f"{name}_observation"]["state"][0]) == idx
+        assert int(item["future_episode_id"]) == (0 if int(item["future_frame_index"]) < 5 else 5)
+        assert int(item["negative_episode_id"]) == (0 if int(item["negative_frame_index"]) < 5 else 5)
 
 
 def test_anchor_observation_matches_index():
