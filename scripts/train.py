@@ -126,6 +126,11 @@ def init_train_state(
             state.replace_by_pure_dict(partial_params)
             model = nnx.merge(graphdef, state)
 
+        # Lagging target networks (e.g. Pi0SP's EMA psi) must start equal to their online
+        # counterpart, including any weights the checkpoint just loaded into it.
+        if (sync_targets := getattr(model, "sync_target_networks", None)) is not None:
+            sync_targets()
+
         params = nnx.state(model)
         # Convert frozen params to bfloat16.
         params = nnx_utils.state_map(params, config.freeze_filter, lambda p: p.replace(p.value.astype(jnp.bfloat16)))
@@ -186,6 +191,11 @@ def train_step(
 
     # Update the model in place and return the new full state.
     nnx.update(model, new_params)
+    # EMA step for lagging target networks (e.g. Pi0SP's psi): they are excluded from
+    # trainable_filter, so the optimizer never touches them and this mutation is what
+    # carries into new_params below.
+    if (update_targets := getattr(model, "update_target_networks", None)) is not None:
+        update_targets()
     new_params = nnx.state(model)
 
     new_state = dataclasses.replace(state, step=state.step + 1, params=new_params, opt_state=new_opt_state)
