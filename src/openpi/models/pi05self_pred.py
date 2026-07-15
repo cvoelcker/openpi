@@ -255,6 +255,27 @@ class Pi0SP(Pi0RepBase):
         sp_resid = not_terminal * (phi_pred - phi_next)
         sp_loss = jnp.mean(jnp.square(sp_resid))
 
+        # ---- Collapse monitor: batch alignment of the prediction (diagnostic only) ----
+        # Is phi_pred(s,a) meaningfully closer to its own target phi_next than to the other
+        # targets in the batch? Under collapse all targets look alike, so top-1 accuracy
+        # falls to chance (1/b) and the InfoNCE-style cross-entropy rises to log(b). Fully
+        # stop-gradient: it never contributes to the training loss.
+        pred_sg = jax.lax.stop_gradient(phi_pred)
+        sq_dists = jnp.sum(jnp.square(pred_sg[:, None, :] - phi_next[None, :, :]), axis=-1)  # (b, b)
+        align_logits = -sq_dists
+        labels = jnp.arange(batch_size)
+        align_ce = -jax.nn.log_softmax(align_logits, axis=-1)[labels, labels]
+        align_acc = (jnp.argmin(sq_dists, axis=-1) == labels).astype(jnp.float32)
+        # Margin: mean off-diagonal distance minus the true-pair distance (positive = aligned).
+        diag_dist = sq_dists[labels, labels]
+        off_diag_mean = (jnp.sum(sq_dists, axis=-1) - diag_dist) / jnp.maximum(batch_size - 1, 1)
+        # Rows with a padded next frame have no valid target; exclude them from the averages.
+        valid = not_terminal[:, 0]
+        n_valid = jnp.maximum(jnp.sum(valid), 1.0)
+        align_ce = jnp.sum(valid * align_ce) / n_valid
+        align_acc = jnp.sum(valid * align_acc) / n_valid
+        align_margin = jnp.sum(valid * (off_diag_mean - diag_dist)) / n_valid
+
         # phi SigREP loss: LeJEPA's SIGReg on the (grad-carrying) current-half phi. Pushing
         # every random 1D projection of the batch toward N(0, 1) drives the embedding
         # distribution to an isotropic Gaussian — the anti-collapse complement to the MSE
@@ -280,6 +301,9 @@ class Pi0SP(Pi0RepBase):
             "phi_std": jnp.mean(jnp.std(phi, axis=0)),
             "phi_mean_norm": jnp.linalg.norm(jnp.mean(phi, axis=0)),
             "sp_resid": jnp.mean(jnp.linalg.norm(sp_resid, axis=-1)),
+            "sp_align_ce": align_ce,
+            "sp_align_acc": align_acc,
+            "sp_align_margin": align_margin,
             "phi_mix_entropy": -jnp.sum(phi_mix_w * jnp.log(phi_mix_w + 1e-6)),
             "phi_mix_max": jnp.max(phi_mix_w),
         }
