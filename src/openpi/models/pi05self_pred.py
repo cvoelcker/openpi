@@ -67,15 +67,17 @@ class ForwardProjHead(nnx.Module):
         latent_dim = config.rep_dim
         self.fc1 = nnx.Linear(input_dim, latent_dim, rngs=rngs)
         self.ln1 = nnx.LayerNorm(latent_dim, rngs=rngs)
-        # Plain list: nnx treats list attributes as graph nodes (no ModuleList in nnx).
-        self.block_list = [BROBlock(latent_dim, rngs) for _ in range(blocks)]
+        # String-keyed nnx.Dict, NOT a plain list: list entries get integer path keys in
+        # the param tree, which breaks the "/"-joined flatten in weight_loaders._merge_params.
+        self.num_blocks = blocks
+        self.block_list = nnx.Dict({f"block_{i}": BROBlock(latent_dim, rngs) for i in range(blocks)})
 
     def __call__(self, x: at.Float[at.Array, "b d"]) -> at.Float[at.Array, "b d"]:
         x = self.fc1(x)
         x = self.ln1(x)
         x = nnx.gelu(x)
-        for block in self.block_list:
-            x = block(x)
+        for i in range(self.num_blocks):
+            x = self.block_list[f"block_{i}"](x)
         return x
 
 
