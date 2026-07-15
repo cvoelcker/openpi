@@ -266,6 +266,15 @@ class Pi0SFConfig(Pi0RepBaseConfig):
     fb_train_goal_ratio: float = 0.5  # fraction of the batch whose z = B(future); rest random
     # Weight on the TD successor-feature loss (Pi0CRLConfig's crl_loss_coeff analogue).
     sf_loss_coeff: float = 1.0
+    # Weight on the psi orthonormality loss E[psi psi^T] ~ I (FB's ortho_coef analogue). This is
+    # the anti-collapse term: with psi stop-gradded in the TD target, it is psi's ONLY gradient
+    # source, so it must be > 0 to keep psi from collapsing to a constant. FB default 1.0.
+    sf_ortho_coeff: float = 1.0
+    # EMA decay for the phi(s',a') target network used in the TD bootstrap. None disables it
+    # (bootstrap uses the online phi head, as before). A float in [0,1) EMAs a float32 copy of
+    # the phi-head pathway (phi_mix/phi_head/phi_proj) toward the online weights each step; the
+    # bootstrap then reads that slower-moving target. Standard TD-stability hygiene. Typical 0.99.
+    sf_target_ema: float | None = None
 
     @override
     def create(self, rng: at.KeyArrayLike) -> "Pi0SF":

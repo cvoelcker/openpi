@@ -79,6 +79,73 @@ def test_loss_is_differentiable():
     assert total > 0.0
 
 
+def test_ortho_metrics_in_info():
+    # The orthonormality (anti-collapse) loss on psi and the off-diagonal cosine collapse metric
+    # must be logged. psi_offdiag_cossim is a mean absolute cosine over distinct-state pairs, so
+    # it lies in [0, 1] (1.0 == collapsed to a single direction).
+    _, model, obs, actions = _make(batch=4)
+    _, info = model.compute_loss(jax.random.key(1), _sf_batch(obs, actions), train=True)
+    for k in ["ortho_loss", "psi_offdiag_cossim"]:
+        assert k in info and bool(jnp.isfinite(info[k]))
+    c = float(info["psi_offdiag_cossim"])
+    assert 0.0 <= c <= 1.0 + 1e-4
+
+
+def test_compute_loss_jit_traceable():
+    # The real train loop jits train_step, so compute_loss must trace cleanly under jax.jit.
+    # The ortho off-diagonal reduction must use masking, not boolean array indexing
+    # (gram[~eye]) — the latter has a value-dependent shape and raises
+    # NonConcreteBooleanIndexError under jit. Eager tests do NOT catch this; this one does.
+    _, model, obs, actions = _make(batch=4)
+    graphdef, state = nnx.split(model)
+    batch = _sf_batch(obs, actions)
+
+    @jax.jit
+    def run(state):
+        m = nnx.merge(graphdef, state)
+        loss, info = m.compute_loss(jax.random.key(1), batch, train=True)
+        return jnp.mean(loss), info["ortho_loss"], info["psi_offdiag_cossim"]
+
+    loss, ortho, cos = run(state)
+    assert bool(jnp.isfinite(loss))
+    assert bool(jnp.isfinite(ortho))
+    assert 0.0 <= float(cos) <= 1.0 + 1e-4
+
+
+def test_psi_trained_only_by_ortho():
+    # Decoupling / anti-collapse: psi is stop-gradded in the TD target, so its ONLY gradient
+    # source is the orthonormality loss. With sf_ortho_coeff=0 the psi head params get zero
+    # gradient; with sf_ortho_coeff>0 they get nonzero gradient. This proves psi and phi no
+    # longer share the TD objective (which is what made the constant-psi fixed point reachable).
+    from jax.tree_util import keystr, tree_flatten_with_path
+
+    psi_parts = ("psi_head", "psi_mix", "psi_proj")
+
+    def psi_grad_mass(ortho_coeff):
+        cfg = Pi0SFConfig(
+            action_dim=32, action_horizon=16,
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m",
+            sf_ortho_coeff=ortho_coeff,
+        )
+        model = cfg.create(jax.random.key(0))
+        obs = cfg.fake_obs(batch_size=4)
+        actions = jnp.zeros((4, cfg.action_horizon, cfg.action_dim), dtype=jnp.float32)
+
+        def loss_only(m):
+            loss, _ = m.compute_loss(jax.random.key(1), _sf_batch(obs, actions), train=True)
+            return jnp.mean(loss)
+
+        grads = nnx.grad(loss_only)(model)
+        total = 0.0
+        for path, val in tree_flatten_with_path(grads)[0]:
+            if isinstance(val, jax.Array) and any(p in keystr(path) for p in psi_parts):
+                total += float(jnp.sum(jnp.abs(val)))
+        return total
+
+    assert psi_grad_mass(0.0) == pytest.approx(0.0, abs=1e-6)
+    assert psi_grad_mass(1.0) > 1e-6
+
+
 def test_next_is_pad_masks_bootstrap():
     # With identical current/next inputs, phi(s,a) == phi(s',a') == V. Masking the bootstrap
     # (next_is_pad=True) changes the TD target from psi + gamma*V to psi alone, so sf_loss must differ.
@@ -191,6 +258,120 @@ def test_frozen_backbone_freeze_filter():
     assert len(trainable) > 0
     rep_parts = ("phi_head", "psi_head", "phi_mix", "psi_mix", "phi_proj", "psi_proj")
     assert all(any(any(t in str(p) for t in rep_parts) for p in path) for path in trainable)
+
+
+def _make_ema(batch: int = 2, decay: float = 0.5):
+    cfg = Pi0SFConfig(
+        action_dim=32, action_horizon=16,
+        paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m",
+        sf_target_ema=decay,
+    )
+    model = cfg.create(jax.random.key(0))
+    obs = cfg.fake_obs(batch_size=batch)
+    actions = jnp.zeros((batch, cfg.action_horizon, cfg.action_dim), dtype=jnp.float32)
+    return cfg, model, obs, actions
+
+
+def test_target_ema_disabled_by_default():
+    # Default (sf_target_ema=None) builds no target leaves and leaves compute_loss on the
+    # online-bootstrap path, so all existing behavior is unchanged.
+    from openpi.models.pi05sf import _SFTarget
+
+    _, model, _, _ = _make()
+    assert model.sf_target_ema is None
+    assert len(jax.tree.leaves(nnx.state(model, _SFTarget))) == 0
+
+
+def test_target_params_are_nonparam_float32():
+    # Target weights must be a distinct non-Param Variable (so the optimizer's
+    # trainable_filter = All(Param, ...) never touches them) and float32 (so the frozen-param
+    # bf16 cast, which is Param-path based, leaves EMA precision intact).
+    from openpi.models.pi05sf import _SFTarget
+
+    _, model, _, _ = _make_ema()
+    tgt = jax.tree.leaves(nnx.state(model, _SFTarget))
+    assert len(tgt) > 0
+    assert all(v.dtype == jnp.float32 for v in tgt)
+    # none of the target leaves are Params
+    param_paths = set(nnx.state(model, nnx.Param).flat_state().keys())
+    target_paths = set(nnx.state(model, _SFTarget).flat_state().keys())
+    assert param_paths.isdisjoint(target_paths)
+
+
+def test_target_state_flattens_with_string_sep():
+    # Weight-loading at init flattens the pure state dict with a string separator
+    # (flax.traverse_util.flatten_dict(state.to_pure_dict(), sep="/") in train.py). Every
+    # state-path component must therefore be a str. A list target container makes nnx emit
+    # integer path components (list indices), which sep.join() rejects -> init crash. The
+    # string-keyed dict container (see _relkey) guards that regression.
+    import flax.traverse_util as traverse_util
+
+    _, model, _, _ = _make_ema()
+    pure = nnx.state(model).to_pure_dict()
+    flat = traverse_util.flatten_dict(pure, sep="/")  # raises TypeError on any int key
+    assert any("_phi_head_target" in k for k in flat)  # target leaves are actually present
+
+
+def test_sync_target_networks_hardcopies_online():
+    # sync_target_networks() (called once at init after the checkpoint merge) hard-copies the
+    # online phi head into the phi target, so a warm-started phi head is reflected in the target.
+    # Perturb every online phi_proj param, sync, and each target leaf must now equal its online
+    # counterpart. This is the warm-start correctness the old path-pairing test guarded.
+    from openpi.models.pi05sf import _SFTarget
+
+    _, model, _, _ = _make_ema()
+    assert len(jax.tree.leaves(nnx.state(model, _SFTarget))) > 0
+    model.phi_proj.kernel.value = model.phi_proj.kernel.value + 3.0  # online now != target
+
+    model.sync_target_networks()
+
+    proj_flat = nnx.state(model.phi_proj).flat_state()
+    for rp in model._phi_proj_relpaths:
+        np.testing.assert_allclose(
+            np.array(model._phi_proj_target[model._relkey(rp)].value),
+            np.array(proj_flat[rp].value),
+            atol=1e-5,
+        )
+
+
+def test_update_target_networks_moves_target_toward_online():
+    # update_target_networks() (called each train_step after the optimizer step) EMAs the phi
+    # target toward the online phi head IN PLACE. Perturb an online param so target != online,
+    # step once, and the target must move toward (not reach) online, while the nnx.state -> merge
+    # roundtrip preserves the _SFTarget type. This is the exact path that is easy to get wrong.
+    from openpi.models.pi05sf import _SFTarget
+
+    _, model, _, _ = _make_ema(decay=0.5)
+    graphdef = nnx.graphdef(model)
+    n_targets = len(jax.tree.leaves(nnx.state(model, _SFTarget)))  # all target leaves (mix+head+proj)
+    model.phi_proj.kernel.value = model.phi_proj.kernel.value + 2.0  # online now differs from target
+    proj_flat = nnx.state(model.phi_proj).flat_state()
+    before = {k: jnp.asarray(t.value) for k, t in model._phi_proj_target.items()}
+
+    model.update_target_networks()  # in-place EMA, exactly as train_step invokes it
+
+    # roundtrip preserves every _SFTarget leaf (count unchanged through state -> merge)
+    model2 = nnx.merge(graphdef, nnx.state(model))
+    assert len(jax.tree.leaves(nnx.state(model2, _SFTarget))) == n_targets
+
+    moved = 0
+    for rp in model._phi_proj_relpaths:
+        k = model._relkey(rp)
+        online = proj_flat[rp].value
+        b, a = before[k], model._phi_proj_target[k].value
+        if not bool(jnp.allclose(b, a)):
+            moved += 1
+            assert float(jnp.abs(a - online).mean()) < float(jnp.abs(b - online).mean())  # closer to online
+    assert moved >= 1
+
+
+def test_compute_loss_with_target_ema_finite():
+    # Integration: with the target bootstrap enabled, compute_loss runs end-to-end and stays
+    # finite (phi_next comes from the merged target head rather than the online head).
+    _, model, obs, actions = _make_ema()
+    loss, info = model.compute_loss(jax.random.key(1), _sf_batch(obs, actions), train=True)
+    assert jnp.isfinite(jnp.mean(loss))
+    assert bool(jnp.isfinite(info["sf_loss"]))
 
 
 def test_compute_loss_raises_without_next_inputs():

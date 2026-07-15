@@ -1,6 +1,7 @@
 import dataclasses
 import functools
 import logging
+import os
 import platform
 import time
 from typing import Any
@@ -244,7 +245,11 @@ def val_step(
 def main(config: _config.TrainConfig):
     init_logging()
 
-    jax.distributed.initialize()
+    # Only initialize JAX distributed for genuine multi-node runs. Upstream calls this
+    # unconditionally, but a single-node launch (no srun) has no SLURM_STEP_NODELIST and
+    # crashes here; guarding on SLURM_NNODES>1 keeps single-node runs on all local GPUs.
+    if int(os.environ.get("SLURM_NNODES", "1")) > 1:
+        jax.distributed.initialize()
 
     is_main_process = jax.process_index() == 0
 
