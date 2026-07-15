@@ -24,6 +24,7 @@ import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
+import openpi.shared.nnx_utils as nnx_utils
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
 import openpi.training.misc.polaris_config as polaris_config
@@ -613,7 +614,15 @@ class TrainConfig:
     @property
     def trainable_filter(self) -> nnx.filterlib.Filter:
         """Get the filter for the trainable parameters."""
-        return nnx.All(nnx.Param, nnx.Not(self.freeze_filter))
+        filters = [nnx.Param, nnx.Not(self.freeze_filter)]
+        # A lagging (EMA-target) psi is updated by update_target_networks() in the train
+        # step, never by gradients: keep the psi trio out of the trainable set so it gets
+        # no optimizer state and nnx.update never overwrites the EMA-mutated values. It is
+        # deliberately NOT in freeze_filter — that would cast it to bfloat16, which is too
+        # coarse for EMA accumulation.
+        if getattr(self.model, "psi_lagging_ema", None) is not None:
+            filters.append(nnx.Not(nnx_utils.PathRegex(r".*psi_(head|mix|proj).*")))
+        return nnx.All(*filters)
 
     def __post_init__(self) -> None:
         if self.resume and self.overwrite:
@@ -1380,12 +1389,13 @@ _CONFIGS = [
         # Self-prediction (Pi0SP) analogue of pi05_crl_libero_full_finetune_frozen: pure
         # representation learning on a frozen backbone (action_loss_coeff=0.0,
         # rep_backbone_grad_scale=0.0 => backbone_frozen). Only the phi head and the
-        # forward-projection MLP train (no psi head is built; see Pi0SPConfig). The loss is
-        # a latent forward-model MSE plus SigREP (LeJEPA's SIGReg isotropic-Gaussian
-        # regularizer — no negatives or temperature). phi is action-independent
-        # (phi_input="state", enforced), so the rep pass is prefix-only and the loader's
-        # next_observation is the target. The freeze_filter builder mirrors the two
-        # freeze-affecting coeffs.
+        # forward-projection MLP train; psi is a frozen lagging EMA copy of phi (the
+        # self-prediction target network — see Pi0SPConfig.psi_lagging_ema), updated after
+        # each optimizer step rather than by gradients. The loss is a latent forward-model
+        # MSE onto psi(s') plus SigREP (LeJEPA's SIGReg isotropic-Gaussian regularizer — no
+        # negatives or temperature). phi is action-independent (phi_input="state",
+        # enforced), so the rep pass is prefix-only and the loader's next_observation is
+        # the target. The freeze_filter builder mirrors the two freeze-affecting coeffs.
         name="pi05_sp_libero_full_finetune_frozen",
         model=pi0_config.Pi0SPConfig(
             pi05=True,

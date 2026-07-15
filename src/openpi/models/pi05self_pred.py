@@ -1,13 +1,20 @@
 """Latent self-prediction (SP) variant of pi05.
 
 Pi0SP trains the phi readout with a latent forward model: a BRO-style residual MLP
-(ForwardProjHead) predicts the next-step rep phi(s') from (phi(s), a). The prediction is
-trained with (1) an MSE regression onto the stop-gradient target phi(s') and (2) SigREP,
-LeJEPA's SIGReg (sketched isotropic-Gaussian regularization): random 1D projections of the
-phi embeddings are pushed toward N(0, 1) via the Epps-Pulley characteristic-function test.
-An isotropic-Gaussian embedding distribution rules out the constant-rep (and any
+(ForwardProjHead) predicts the next-step rep from (phi(s), a). The prediction is trained
+with (1) an MSE regression onto a target rep of s' and (2) SigREP, LeJEPA's SIGReg
+(sketched isotropic-Gaussian regularization): random 1D projections of the phi embeddings
+are pushed toward N(0, 1) via the Epps-Pulley characteristic-function test. An
+isotropic-Gaussian embedding distribution rules out the constant-rep (and any
 low-dimensional) collapse that the regression alone admits — without negatives, a
 temperature, or other contrastive machinery.
+
+The target rep is, by default, psi(s') where psi is a frozen lagging (EMA) copy of phi — a
+BYOL/JEPA-style target network that stabilizes the bootstrap (the online net would otherwise
+chase its own moving output). The psi trio never receives gradients; the train loop
+EMA-tracks it toward phi after every optimizer step (rep_base.update_target_networks). With
+psi_lagging_ema=None there is no psi and the target falls back to the stop-gradient online
+phi(s').
 
 Like Pi0CRL, the reps come from Pi0RepBase's dedicated attention-pooling heads over a learned
 softmax mix of all backbone layers; there are no readout tokens in the backbone sequence, so
@@ -117,9 +124,10 @@ def _sigreg_epps_pulley(
 class Pi0SP(Pi0RepBase):
     # phi must stay unnormalized: SIGReg drives its distribution to an isotropic Gaussian,
     # which pins the scale — L2 normalization would fight the regularizer (and destroy the
-    # Gaussian shape). There is no psi head (Pi0SPConfig sets enable_psi_head=False); psi
-    # accessors serve phi.
+    # Gaussian shape). psi (the lagging EMA copy of phi, when built) mirrors phi's policy:
+    # the regression target must live in the same raw space.
     _normalize_phi = False
+    _normalize_psi = False
 
     def __init__(self, config: pi0_config.Pi0SPConfig, rngs: nnx.Rngs):
         super().__init__(config, rngs)
@@ -150,16 +158,18 @@ class Pi0SP(Pi0RepBase):
         timestep: at.Float[at.Array, " b"] | None = None,
         z: at.Float[at.Array, "b d"] | None = None,
     ):
-        """Pi0SP has no psi head: the psi slot is served the phi rep instead.
+        """With a lagging psi, the psi slot serves the stable EMA rep; without one, phi.
 
-        phi is the model's only trained state feature (action-independent,
-        phi_input="state"), so downstream psi consumers (goal encoders, eval probes)
-        get phi from the same prefix pass.
+        Downstream psi consumers (goal encoders, eval probes) thus get the slowly-moving
+        target rep when the target network is enabled, and the online phi otherwise —
+        either way from the same single prefix pass.
         """
-        _, phi, kv_cache, prefix_mask, prefix_len = super().get_state_representations(
+        psi, phi, kv_cache, prefix_mask, prefix_len = super().get_state_representations(
             observation, noisy_actions, timestep, z=z
         )
-        return phi, phi, kv_cache, prefix_mask, prefix_len
+        if psi is None:
+            psi = phi
+        return psi, phi, kv_cache, prefix_mask, prefix_len
 
     @override
     def compute_loss(
@@ -169,7 +179,7 @@ class Pi0SP(Pi0RepBase):
         *,
         train: bool = False,
     ) -> tuple[at.Float[at.Array, "*b ah"], dict[str, at.Array]]:
-        """Latent self-prediction loss (MSE + SigREP sigmoid contrastive) + flow-matching action loss.
+        """Latent self-prediction loss (MSE onto the lagging-psi target + SigREP) + flow-matching action loss.
 
         Required batch keys: observation, actions, next_observation. phi is
         action-independent (phi_input="state", enforced by Pi0SPConfig), so no
@@ -212,11 +222,11 @@ class Pi0SP(Pi0RepBase):
         )
         _, prefix_hidden, _, prefix_mask, _ = self._run_prefix(obs_stacked)
 
-        # phi via Pi0RepBase._compute_rep from the prefix. Layer axis is 0, so slice the
+        # Reps via Pi0RepBase._compute_rep from the prefix. Layer axis is 0, so slice the
         # batch on axis 1.
-        def _rep_slice(sl, drop_rng, *, det):
+        def _rep_slice(which, sl, drop_rng, *, det):
             return self._compute_rep(
-                "phi",
+                which,
                 prefix_hidden[:, sl],
                 None,
                 prefix_mask[sl],
@@ -227,11 +237,15 @@ class Pi0SP(Pi0RepBase):
 
         cur = slice(None, batch_size)
         nxt = slice(batch_size, None)
-        phi = _rep_slice(cur, phi_drop_rng, det=deterministic).astype(jnp.float32)
+        phi = _rep_slice("phi", cur, phi_drop_rng, det=deterministic).astype(jnp.float32)
         # Actions are flattened to (b, ah*ad) to concat with the (b, d) rep.
         phi_sa = jnp.concatenate([phi, actions.reshape(batch_size, -1)], axis=-1)
         phi_pred = self.forward_proj(phi_sa)
-        phi_next = jax.lax.stop_gradient(_rep_slice(nxt, None, det=True).astype(jnp.float32))
+        # Prediction target: the lagging EMA psi(s') when the target network is enabled
+        # (psi gets no gradients anyway, but stop_gradient also severs the backbone path
+        # through the next-half hiddens), else the stop-gradient online phi(s').
+        target_head = "psi" if self.psi_lagging_ema is not None else "phi"
+        phi_next = jax.lax.stop_gradient(_rep_slice(target_head, nxt, None, det=True).astype(jnp.float32))
 
         # Mask the prediction at episode boundaries: a padded next frame is not a valid target.
         if next_is_pad is None:
@@ -262,6 +276,7 @@ class Pi0SP(Pi0RepBase):
             "sp_loss": sp_loss,
             "sigrep_loss": sigrep_loss,
             "phi_norm": jnp.mean(jnp.linalg.norm(phi, axis=-1)),
+            "target_norm": jnp.mean(jnp.linalg.norm(phi_next, axis=-1)),
             "phi_std": jnp.mean(jnp.std(phi, axis=0)),
             "phi_mean_norm": jnp.linalg.norm(jnp.mean(phi, axis=0)),
             "sp_resid": jnp.mean(jnp.linalg.norm(sp_resid, axis=-1)),

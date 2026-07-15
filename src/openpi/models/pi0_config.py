@@ -169,9 +169,16 @@ class Pi0RepBaseConfig(Pi0Config):
     # frozen backbone; helps close the train<<val rep-loss gap.
     rep_head_dropout: float = 0.0
     # Whether to build the psi trio (psi_head/psi_mix/psi_proj) at all. Subclasses whose
-    # loss never reads psi (Pi0SP) disable it to drop ~1e8 dead params and, in the
+    # loss never reads psi disable it to drop ~1e8 dead params and, in the
     # frozen-backbone regime, their optimizer state.
     enable_psi_head: bool = True
+    # If set, psi is not trained by gradient descent; instead it is a lagging EMA copy of
+    # phi (a BYOL/JEPA-style target network): psi <- ema * psi + (1 - ema) * phi after every
+    # optimizer step. psi is initialized to phi and requires the same architecture
+    # (psi_input == phi_input). TrainConfig.trainable_filter excludes the psi trio when this
+    # is set, so it gets no gradients, no optimizer state, and stays float32 (never routed
+    # through the bfloat16 freeze cast — EMA accumulation needs the precision).
+    psi_lagging_ema: float | None = None
 
     def __post_init__(self):
         super().__post_init__()
@@ -179,6 +186,16 @@ class Pi0RepBaseConfig(Pi0Config):
             raise ValueError(f"phi_input must be one of {_REP_INPUTS}, got {self.phi_input!r}")
         if self.psi_input not in _REP_INPUTS:
             raise ValueError(f"psi_input must be one of {_REP_INPUTS}, got {self.psi_input!r}")
+        if self.psi_lagging_ema is not None:
+            if not self.enable_psi_head:
+                raise ValueError("psi_lagging_ema requires enable_psi_head=True (psi is the lagging copy of phi)")
+            if not 0.0 <= self.psi_lagging_ema < 1.0:
+                raise ValueError(f"psi_lagging_ema must be in [0, 1), got {self.psi_lagging_ema}")
+            if self.psi_input != self.phi_input:
+                raise ValueError(
+                    "psi_lagging_ema requires psi_input == phi_input (the lagging psi mirrors phi's "
+                    f"architecture), got psi_input={self.psi_input!r}, phi_input={self.phi_input!r}"
+                )
 
     @property
     @override
@@ -262,17 +279,23 @@ class Pi0SPConfig(Pi0RepBaseConfig):
     """Config for the Self-Prediction variant of Pi0.
 
     Instantiates pi05self_pred.Pi0SP, which trains the phi head with a latent self-prediction
-    loss (MSE + SigREP) alongside the flow-matching action loss. phi is the model's only
-    state feature: the psi head is not built, and psi accessors serve phi instead.
+    loss (MSE + SigREP) alongside the flow-matching action loss. With the default
+    psi_lagging_ema, psi is a frozen lagging (EMA) copy of phi that provides the
+    self-prediction target — a BYOL/JEPA-style target network that stabilizes the bootstrap.
+    With psi_lagging_ema=None the psi trio is not built and the target is the stop-gradient
+    online phi (the original behavior); psi accessors then serve phi instead.
     """
 
-    # Pi0SP's loss never reads psi — don't build the psi trio at all.
-    enable_psi_head: bool = False
+    # EMA decay of the lagging psi target (see Pi0RepBaseConfig.psi_lagging_ema). None
+    # disables the target network entirely: no psi trio, stop-gradient online targets.
+    # enable_psi_head is derived from this in __post_init__ — do not set it directly.
+    psi_lagging_ema: float | None = 0.995
     # phi must be action-independent ("state"): the actions enter the forward model
     # explicitly, concatenated to phi(s) in ForwardProjHead. A suffix ("state_action") phi
     # would leak the action into both the input rep and the prediction target.
     # Enforced in __post_init__.
     phi_input: str = "state"
+    psi_input: str = "state"
     sp_loss_coeff: float = 1.0  # Weight on the self-prediction (MSE) loss
     forward_proj_blocks: int = 2  # Number of BRO blocks in the forward projection head
     # Weight on the SigREP loss — LeJEPA's SIGReg (sketched isotropic-Gaussian
@@ -288,6 +311,8 @@ class Pi0SPConfig(Pi0RepBaseConfig):
     sigrep_num_t: int = 17
 
     def __post_init__(self):
+        # psi exists exactly when it serves as the lagging target (SP has no other psi use).
+        object.__setattr__(self, "enable_psi_head", self.psi_lagging_ema is not None)
         super().__post_init__()
         if self.phi_input != "state":
             raise ValueError(

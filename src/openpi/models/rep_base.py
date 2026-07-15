@@ -144,6 +144,44 @@ class Pi0RepBase(_pi0.Pi0):
         self.phi_proj = nnx.Linear(phi_mem_width, config.rep_dim, rngs=rngs)
         self.psi_proj = nnx.Linear(psi_mem_width, config.rep_dim, rngs=rngs) if config.enable_psi_head else None
 
+        # Lagging-psi target network (BYOL/JEPA-style): when set, psi is never trained by
+        # gradient descent — TrainConfig.trainable_filter excludes the psi trio — and is
+        # instead EMA-tracked toward phi via update_target_networks() after each optimizer
+        # step. Start psi as an exact copy of phi (their fresh inits used different rng draws).
+        self.psi_lagging_ema = config.psi_lagging_ema
+        if config.psi_lagging_ema is not None:
+            self._blend_lagging_psi(0.0)
+
+    def _blend_lagging_psi(self, tau: float):
+        """psi <- tau * psi + (1 - tau) * phi across the head/mix/proj trio.
+
+        Valid because psi_lagging_ema enforces psi_input == phi_input, so the two trios are
+        architecturally identical. tau=0.0 is a hard sync.
+        """
+        for online, target in ((self.phi_head, self.psi_head), (self.phi_proj, self.psi_proj)):
+            online_state = nnx.state(online, nnx.Param)
+            target_state = nnx.state(target, nnx.Param)
+            nnx.update(target, jax.tree.map(lambda t, o: tau * t + (1.0 - tau) * o, target_state, online_state))
+        self.psi_mix.value = tau * self.psi_mix.value + (1.0 - tau) * self.phi_mix.value
+
+    def sync_target_networks(self):
+        """Hard-copy phi into the lagging psi (no-op without psi_lagging_ema).
+
+        The train script calls this once after merging checkpoint weights: a warm-start
+        checkpoint may carry a trained phi head (and possibly a psi trained under a different
+        objective), and the lagging target must start equal to the online net.
+        """
+        if self.psi_lagging_ema is not None:
+            self._blend_lagging_psi(0.0)
+
+    def update_target_networks(self):
+        """One EMA step of the lagging psi (no-op without psi_lagging_ema).
+
+        The train script calls this after every optimizer step, on the updated params.
+        """
+        if self.psi_lagging_ema is not None:
+            self._blend_lagging_psi(self.psi_lagging_ema)
+
     @staticmethod
     def _scale_grad(x, scale: float):
         # 0 => full stop-gradient (cleanest graph); 1 => identity; else partial.
