@@ -304,14 +304,6 @@ def main(config: _config.TrainConfig):
     logging.info("Fetched first batch in %.3f s", t1 - t0)
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
 
-    if is_main_process:
-        obs_images = batch["observation"].images
-        images_to_log = [
-            wandb.Image(np.concatenate([np.array(img[i]) for img in obs_images.values()], axis=1))
-            for i in range(min(5, len(next(iter(obs_images.values())))))
-        ]
-        wandb.log({"camera_views": images_to_log}, step=0)
-
     train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)
     jax.block_until_ready(train_state)
     logging.info(f"Initialized train state:\n{training_utils.array_tree_to_info(train_state.params)}")

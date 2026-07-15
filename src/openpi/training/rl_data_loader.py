@@ -411,6 +411,24 @@ class IterableHERTransformedDataset(_data_loader.IterableDataset):
         return len(self._dataset)
 
 
+def _process_sharded_sampler(indices: np.ndarray, *, shuffle: bool, seed: int) -> torch.utils.data.Sampler | list[int]:
+    """Sampler over `indices` restricted to this process's (rank-strided) shard.
+
+    The torch loaders here feed jax.make_array_from_process_local_data, which assembles the
+    global batch from each process's local batch — so every process must draw a disjoint
+    slice of the data. Without this, the identically-seeded loaders yield the same local
+    batch on every process and the "global" batch is jax.process_count() copies of it.
+    A persistent seeded generator draws a fresh permutation every epoch while staying
+    reproducible across runs.
+    """
+    local = indices[jax.process_index() :: jax.process_count()].tolist()
+    if not shuffle:
+        return local
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+    return torch.utils.data.SubsetRandomSampler(local, generator=generator)
+
+
 def create_goal_conditioned_data_loader(
     config: _config.TrainConfig,
     *,
@@ -503,11 +521,18 @@ def create_goal_conditioned_data_loader(
     local_batch_size = config.batch_size // jax.process_count()
     logger.info(f"local_batch_size: {local_batch_size}")
 
+    # Multi-process: each process samples a disjoint shard (single-process keeps the
+    # plain shuffle path so existing single-GPU runs draw the exact same batches).
+    sampler = None
+    if jax.process_count() > 1:
+        sampler = _process_sharded_sampler(np.arange(len(dataset)), shuffle=shuffle, seed=config.seed)
+
     torch_loader = _data_loader.TorchDataLoader(
         dataset,
         local_batch_size=local_batch_size,
         sharding=sharding,
-        shuffle=shuffle,
+        shuffle=(sampler is None and shuffle),
+        sampler=sampler,
         num_batches=num_batches,
         num_workers=config.num_workers,
         seed=config.seed,
@@ -591,7 +616,9 @@ def create_train_val_goal_conditioned_data_loaders(
             task_to_frames=split_task_to_frames,
         )
         local_batch_size = config.batch_size // jax.process_count()
-        sampler = torch.utils.data.SubsetRandomSampler(indices.tolist())
+        # Random order for train AND val (see the num_workers comment below for why val
+        # samples randomly too), each process drawing a disjoint shard of the split.
+        sampler = _process_sharded_sampler(np.asarray(indices), shuffle=True, seed=config.seed)
         # Use the same worker count for train and val. With per-worker RNG seeding
         # (`_rng` = default_rng([seed, worker_id])), a val loader pinned to num_workers=0 would
         # draw all its futures/goals/negatives from a single persistent stream — lower sampling
