@@ -14,6 +14,7 @@ import openpi.shared.nnx_utils as nnx_utils
 if TYPE_CHECKING:
     from openpi.models.pi0 import Pi0
     from openpi.models.pi05crl import Pi0CRL
+    from openpi.models.pi05self_pred import Pi0SP
     from openpi.models.pi05sf import Pi0SF
 
 
@@ -167,6 +168,10 @@ class Pi0RepBaseConfig(Pi0Config):
     # training only. 0.0 = off. A regularizer for the small trainable head set over a
     # frozen backbone; helps close the train<<val rep-loss gap.
     rep_head_dropout: float = 0.0
+    # Whether to build the psi trio (psi_head/psi_mix/psi_proj) at all. Subclasses whose
+    # loss never reads psi (Pi0SP) disable it to drop ~1e8 dead params and, in the
+    # frozen-backbone regime, their optimizer state.
+    enable_psi_head: bool = True
 
     def __post_init__(self):
         super().__post_init__()
@@ -250,3 +255,58 @@ class Pi0SFConfig(Pi0RepBaseConfig):
         from openpi.models.pi05sf import Pi0SF
 
         return Pi0SF(self, rngs=nnx.Rngs(rng))
+
+
+@dataclasses.dataclass(frozen=True)
+class Pi0SPConfig(Pi0RepBaseConfig):
+    """Config for the Self-Prediction variant of Pi0.
+
+    Instantiates pi05self_pred.Pi0SP, which trains the phi head with a latent self-prediction
+    loss (MSE + SigREP) alongside the flow-matching action loss. phi is the model's only
+    state feature: the psi head is not built, and psi accessors serve phi instead.
+    """
+
+    # Pi0SP's loss never reads psi — don't build the psi trio at all.
+    enable_psi_head: bool = False
+    # phi must be action-independent ("state"): the actions enter the forward model
+    # explicitly, concatenated to phi(s) in ForwardProjHead. A suffix ("state_action") phi
+    # would leak the action into both the input rep and the prediction target.
+    # Enforced in __post_init__.
+    phi_input: str = "state"
+    sp_loss_coeff: float = 1.0  # Weight on the self-prediction (MSE) loss
+    forward_proj_blocks: int = 2  # Number of BRO blocks in the forward projection head
+    # Weight on the SigREP loss — LeJEPA's SIGReg (sketched isotropic-Gaussian
+    # regularization of the phi distribution), the anti-collapse complement to the MSE.
+    # 0.0 disables it. Note the Epps-Pulley statistic is small (bounded, CF-scale), so this
+    # coefficient typically wants to be >> the MSE's.
+    sigrep_loss_coeff: float = 1.0
+    # SIGReg sketch/quadrature: number of random 1D projections (resampled every step), and
+    # the Epps-Pulley integration grid over t in [-sigrep_t_max, sigrep_t_max]. The N(0,1)
+    # weight makes tails beyond |t|~4 negligible.
+    sigrep_num_slices: int = 512
+    sigrep_t_max: float = 4.0
+    sigrep_num_t: int = 17
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.phi_input != "state":
+            raise ValueError(
+                "Pi0SP requires phi_input='state': actions are concatenated to phi explicitly "
+                f"in ForwardProjHead, got phi_input={self.phi_input!r}"
+            )
+
+    @override
+    def get_freeze_filter(self) -> nnx.filterlib.Filter:
+        # Same regime as Pi0RepBaseConfig, but forward_proj must stay trainable too: it takes
+        # the (trainable) phi head's output, so it trains even with a frozen backbone.
+        # SigREP itself has no learnable parameters.
+        if self.backbone_frozen:
+            trainable = nnx_utils.PathRegex(r".*((phi|psi)_(head|mix|proj)|forward_proj).*")
+            return nnx.Not(trainable)
+        return super().get_freeze_filter()
+
+    @override
+    def create(self, rng: at.KeyArrayLike) -> "Pi0SP":
+        from openpi.models.pi05self_pred import Pi0SP
+
+        return Pi0SP(self, rngs=nnx.Rngs(rng))

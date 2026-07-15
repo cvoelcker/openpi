@@ -118,23 +118,31 @@ class Pi0RepBase(_pi0.Pi0):
         def _head_config(width):
             return dataclasses.replace(paligemma_config, width=width, depth=config.rep_head_depth, lora_configs={})
 
-        psi_head = nnx_bridge.ToNNX(
-            _RepHead(_head_config(psi_mem_width), config.dtype, dropout=config.rep_head_dropout)
-        )
-        psi_head.lazy_init(jnp.zeros((1, 2, psi_mem_width)), jnp.ones((1, 2), dtype=bool), rngs=rngs)
+        # The psi trio (psi_head/psi_mix/psi_proj) is optional: subclasses whose loss never
+        # reads psi (Pi0SP) set enable_psi_head=False to drop ~1e8 dead params — and their
+        # optimizer state in the frozen-backbone regime, where the freeze filter would
+        # otherwise mark psi_* trainable. psi construction stays first so the rng draws of
+        # the default (enabled) path are unchanged.
+        if config.enable_psi_head:
+            psi_head = nnx_bridge.ToNNX(
+                _RepHead(_head_config(psi_mem_width), config.dtype, dropout=config.rep_head_dropout)
+            )
+            psi_head.lazy_init(jnp.zeros((1, 2, psi_mem_width)), jnp.ones((1, 2), dtype=bool), rngs=rngs)
+            self.psi_head = psi_head
+        else:
+            self.psi_head = None
         phi_head = nnx_bridge.ToNNX(
             _RepHead(_head_config(phi_mem_width), config.dtype, dropout=config.rep_head_dropout)
         )
         phi_head.lazy_init(jnp.zeros((1, 2, phi_mem_width)), jnp.ones((1, 2), dtype=bool), rngs=rngs)
-        self.psi_head = psi_head
         self.phi_head = phi_head
 
         # Learned softmax mix over all backbone layers, initialized to favor early layers.
-        self.psi_mix = nnx.Param(jnp.linspace(1.0, -1.0, num_backbone_layers))
+        self.psi_mix = nnx.Param(jnp.linspace(1.0, -1.0, num_backbone_layers)) if config.enable_psi_head else None
         self.phi_mix = nnx.Param(jnp.linspace(1.0, -1.0, num_backbone_layers))
 
         self.phi_proj = nnx.Linear(phi_mem_width, config.rep_dim, rngs=rngs)
-        self.psi_proj = nnx.Linear(psi_mem_width, config.rep_dim, rngs=rngs)
+        self.psi_proj = nnx.Linear(psi_mem_width, config.rep_dim, rngs=rngs) if config.enable_psi_head else None
 
     @staticmethod
     def _scale_grad(x, scale: float):
@@ -163,6 +171,8 @@ class Pi0RepBase(_pi0.Pi0):
         dropout_rng=None,
     ):
         """Compute the raw (unnormalized) phi or psi rep from its configured input source."""
+        if getattr(self, f"{which}_head") is None:
+            raise ValueError(f"the {which} head is disabled (enable_psi_head=False)")
         source = getattr(self, f"{which}_input")
         hidden, mask = (prefix_hidden, prefix_mask) if source == "state" else (suffix_hidden, suffix_mask)
         if hidden is None:
@@ -178,36 +188,53 @@ class Pi0RepBase(_pi0.Pi0):
         normalize = self._normalize_phi if which == "phi" else self._normalize_psi
         return _l2_normalize(rep) if normalize else rep.astype(jnp.float32)
 
-    def get_psi_representation(
-        self, observation: _model.Observation
-    ) -> tuple[at.Float[at.Array, "b emb"], "KVCache", at.Bool[at.Array, "b s"], int]:
-        """Compute the psi representation from a prefix-only pass.
+    def _reps_from_prefix(self, observation: _model.Observation, which: tuple[str, ...]):
+        """Preprocess + ONE prefix pass, then read the requested prefix-sourced reps from it.
 
-        Requires psi_input="state" (a prefix pass has no action tokens).
-        Returns (psi_rep, kv_cache, prefix_mask, prefix_len).
+        Every rep in `which` must have its input set to "state" (a prefix pass has no
+        action tokens). Returns (reps_tuple, kv_cache, prefix_mask, prefix_len).
         """
-        if self.psi_input != "state":
-            raise ValueError("get_psi_representation requires psi_input='state'")
+        for w in which:
+            if getattr(self, f"{w}_input") != "state":
+                raise ValueError(f"computing {w} from a prefix-only pass requires {w}_input='state'")
         observation = _model.preprocess_observation(None, observation, train=False)
         _, prefix_hidden, kv_cache, prefix_mask, prefix_len = self._run_prefix(observation)
-        psi_rep = self._finalize_rep("psi", self._compute_rep("psi", prefix_hidden, None, prefix_mask, None))
-        return psi_rep, kv_cache, prefix_mask, prefix_len
+        reps = tuple(self._finalize_rep(w, self._compute_rep(w, prefix_hidden, None, prefix_mask, None)) for w in which)
+        return reps, kv_cache, prefix_mask, prefix_len
 
     def get_state_representations(
-        self, observation: _model.Observation
-    ) -> tuple[at.Float[at.Array, "b emb"], at.Float[at.Array, "b emb"], "KVCache", at.Bool[at.Array, "b s"], int]:
-        """State-only mode: compute both representations from a single prefix pass.
+        self,
+        observation: _model.Observation,
+        noisy_actions: _model.Actions | None = None,
+        timestep: at.Float[at.Array, "b"] | None = None,
+        z: at.Float[at.Array, "b d"] | None = None,
+    ) -> tuple[
+        at.Float[at.Array, "b emb"] | None,
+        at.Float[at.Array, "b emb"] | None,
+        "KVCache",
+        at.Bool[at.Array, "b s"],
+        int,
+    ]:
+        """Unified state-side accessor: every rep computable from a full forward pass.
 
-        Requires phi_input="state" and psi_input="state" (both reps action-independent).
-        Returns (psi_rep, phi_rep, kv_cache, prefix_mask, prefix_len).
+        Reps whose head is disabled (enable_psi_head=False) come back None. A
+        state_action-sourced phi needs noisy_actions and timestep for the suffix pass;
+        without them the phi slot is None.
         """
-        if self.phi_input != "state" or self.psi_input != "state":
-            raise ValueError("get_state_representations requires phi_input='state' and psi_input='state'")
-        observation = _model.preprocess_observation(None, observation, train=False)
-        _, prefix_hidden, kv_cache, prefix_mask, prefix_len = self._run_prefix(observation)
-        psi_rep = self._finalize_rep("psi", self._compute_rep("psi", prefix_hidden, None, prefix_mask, None))
-        phi_rep = self._finalize_rep("phi", self._compute_rep("phi", prefix_hidden, None, prefix_mask, None))
-        return psi_rep, phi_rep, kv_cache, prefix_mask, prefix_len
+        which = tuple(
+            w
+            for w in ("psi", "phi")
+            if getattr(self, f"{w}_input") == "state" and getattr(self, f"{w}_head") is not None
+        )
+        reps, kv_cache, prefix_mask, prefix_len = self._reps_from_prefix(observation, which)
+        by_name = dict(zip(which, reps, strict=True))
+        psi = by_name.get("psi")
+        phi = by_name.get("phi")
+        if phi is None and self.phi_input == "state_action" and noisy_actions is not None and timestep is not None:
+            phi = self.get_phi_representation(
+                observation, noisy_actions, timestep, kv_cache, prefix_mask, prefix_len, z=z
+            )[0]
+        return psi, phi, kv_cache, prefix_mask, prefix_len
 
     def get_phi_representation(
         self,

@@ -1377,6 +1377,53 @@ _CONFIGS = [
     ),
 
     TrainConfig(
+        # Self-prediction (Pi0SP) analogue of pi05_crl_libero_full_finetune_frozen: pure
+        # representation learning on a frozen backbone (action_loss_coeff=0.0,
+        # rep_backbone_grad_scale=0.0 => backbone_frozen). Only the phi head and the
+        # forward-projection MLP train (no psi head is built; see Pi0SPConfig). The loss is
+        # a latent forward-model MSE plus SigREP (LeJEPA's SIGReg isotropic-Gaussian
+        # regularizer — no negatives or temperature). phi is action-independent
+        # (phi_input="state", enforced), so the rep pass is prefix-only and the loader's
+        # next_observation is the target. The freeze_filter builder mirrors the two
+        # freeze-affecting coeffs.
+        name="pi05_sp_libero_full_finetune_frozen",
+        model=pi0_config.Pi0SPConfig(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            rep_dim=2048,
+            action_loss_coeff=0.0,
+            rep_backbone_grad_scale=0.0,
+            rep_head_dropout=0.1,
+        ),
+        freeze_filter=pi0_config.Pi0SPConfig(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            action_loss_coeff=0.0,
+            rep_backbone_grad_scale=0.0,
+        ).get_freeze_filter(),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            # No include_negative_observation: negatives are a CRL concept; SIGReg
+            # regularizes the embedding distribution and needs none.
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_libero/params"),
+        num_train_steps=30_000,
+    ),
+
+    TrainConfig(
         name="pi05_crl_libero_full_finetune_pretrained",
         model=pi0_config.Pi0CRLConfig(
             pi05=True,

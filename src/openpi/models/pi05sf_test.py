@@ -41,8 +41,16 @@ def test_compute_loss_shapes_and_finite():
     loss, info = model.compute_loss(jax.random.key(1), _sf_batch(obs, actions), train=True)
     assert jnp.isfinite(jnp.mean(loss))
     # rep_loss aliases sf_loss so the train loop's shared logging works unchanged.
-    for k in ["action_loss", "sf_loss", "rep_loss", "phi_norm", "psi_norm", "sf_td_resid",
-              "phi_mix_entropy", "psi_mix_entropy"]:
+    for k in [
+        "action_loss",
+        "sf_loss",
+        "rep_loss",
+        "phi_norm",
+        "psi_norm",
+        "sf_td_resid",
+        "phi_mix_entropy",
+        "psi_mix_entropy",
+    ]:
         assert k in info and bool(jnp.isfinite(info[k]))
     np.testing.assert_allclose(np.array(info["rep_loss"]), np.array(info["sf_loss"]))
 
@@ -78,9 +86,7 @@ def test_next_is_pad_masks_bootstrap():
     b = obs.state.shape[0]
 
     def sf_loss(next_is_pad):
-        _, info = model.compute_loss(
-            jax.random.key(1), _sf_batch(obs, actions, next_is_pad=next_is_pad), train=True
-        )
+        _, info = model.compute_loss(jax.random.key(1), _sf_batch(obs, actions, next_is_pad=next_is_pad), train=True)
         return float(info["sf_loss"])
 
     loss_bootstrap = sf_loss(jnp.zeros((b,), dtype=bool))
@@ -97,23 +103,23 @@ def test_compute_loss_logs_z_goal_frac():
     assert 0.0 <= float(info["z_goal_frac"]) <= 1.0
 
 
-def test_get_psi_representation_shape_and_norm():
+def test_get_state_representations_shape_and_norm():
     cfg, model, obs, _ = _make()
     b = obs.state.shape[0]
-    psi, kv_cache, prefix_mask, prefix_len = model.get_psi_representation(obs)
+    psi, phi, kv_cache, prefix_mask, prefix_len = model.get_state_representations(obs)
     assert psi.shape == (b, cfg.rep_dim)
+    # Default phi_input="state_action": phi is action-dependent and not available here.
+    assert phi is None
     np.testing.assert_allclose(np.array(jnp.linalg.norm(psi, axis=-1)), 1.0, atol=1e-3)
 
 
 def test_get_phi_representation_shapes():
     cfg, model, obs, actions = _make()
     b = obs.state.shape[0]
-    _, kv_cache, prefix_mask, prefix_len = model.get_psi_representation(obs)
+    _, _, kv_cache, prefix_mask, prefix_len = model.get_state_representations(obs)
     obs_pp = _model.preprocess_observation(None, obs, train=False)
     timestep = jnp.zeros((b,), dtype=jnp.float32)
-    phi, action_hidden, v_t = model.get_phi_representation(
-        obs_pp, actions, timestep, kv_cache, prefix_mask, prefix_len
-    )
+    phi, action_hidden, v_t = model.get_phi_representation(obs_pp, actions, timestep, kv_cache, prefix_mask, prefix_len)
     assert phi.shape == (b, cfg.rep_dim)
     assert v_t.shape == (b, cfg.action_horizon, cfg.action_dim)
 
@@ -127,7 +133,7 @@ def test_adarms_cond_depends_on_z():
     b = obs.state.shape[0]
     obs_pp = _model.preprocess_observation(None, obs, train=False)
     t = jnp.zeros((b,), dtype=jnp.float32)
-    unit = jnp.ones((b, cfg.rep_dim), dtype=jnp.float32) / (cfg.rep_dim ** 0.5)
+    unit = jnp.ones((b, cfg.rep_dim), dtype=jnp.float32) / (cfg.rep_dim**0.5)
     *_, cond_pos = model.embed_suffix(obs_pp, actions, t, z=unit)
     *_, cond_neg = model.embed_suffix(obs_pp, actions, t, z=-unit)
     *_, cond_none = model.embed_suffix(obs_pp, actions, t)
@@ -156,9 +162,12 @@ def test_paligemma_lora_rank_is_honored():
     # default (16) and counts match.
     def build(rank):
         cfg = Pi0SFConfig(
-            action_dim=32, action_horizon=16,
-            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m",
-            paligemma_lora_rank=rank, paligemma_lora_alpha=float(rank),
+            action_dim=32,
+            action_horizon=16,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m",
+            paligemma_lora_rank=rank,
+            paligemma_lora_alpha=float(rank),
         )
         return _count_params(cfg.create(jax.random.key(0)))
 
@@ -169,9 +178,12 @@ def test_frozen_backbone_freeze_filter():
     # With action_loss_coeff=0 and rep_backbone_grad_scale=0 the backbone gets no gradient;
     # the freeze filter must keep only the phi/psi head params (heads, mixes, projections).
     cfg = Pi0SFConfig(
-        action_dim=32, action_horizon=16,
-        paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m",
-        action_loss_coeff=0.0, rep_backbone_grad_scale=0.0,
+        action_dim=32,
+        action_horizon=16,
+        paligemma_variant="gemma_2b_lora",
+        action_expert_variant="gemma_300m",
+        action_loss_coeff=0.0,
+        rep_backbone_grad_scale=0.0,
     )
     assert cfg.backbone_frozen
     abstract_model = nnx.eval_shape(cfg.create, jax.random.key(0))

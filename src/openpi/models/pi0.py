@@ -316,22 +316,37 @@ class Pi0(_model.BaseModel):
         kv_cache,
         prefix_mask: at.Bool[at.Array, "b s"],
         prefix_len: int,
+        z: at.Float[at.Array, "b d"] | None = None,
     ) -> tuple[at.Float[at.Array, "*b emb"], at.Float[at.Array, "*b ah emb"], at.Float[at.Array, "*b ah ad"]]:
         """Mean-pooled action-expert embedding of the suffix (state-action, action-dependent).
 
         The steering primitive for the action side, independent of any learned phi/psi heads.
         Returns (embedding, action_hidden, v_t).
         """
-        suffix_out, _, _ = self._suffix_forward(observation, noisy_actions, timestep, kv_cache, prefix_mask, prefix_len)
+        suffix_out, _, _ = self._suffix_forward(
+            observation, noisy_actions, timestep, kv_cache, prefix_mask, prefix_len, z=z
+        )
         action_hidden = suffix_out[:, -self.action_horizon :]
         v_t = self.action_out_proj(action_hidden)
         return jnp.mean(suffix_out, axis=1), action_hidden, v_t
 
-    def get_psi_representation(
+    def get_state_representations(
         self, observation: _model.Observation
-    ) -> tuple[at.Float[at.Array, "b emb"], "KVCache", at.Bool[at.Array, "b s"], int]:
-        """Steering-compat alias: the base model's psi is the mean prefix embedding."""
-        return self.get_prefix_mean_embedding(observation)
+    ) -> tuple[
+        at.Float[at.Array, "b emb"] | None,
+        at.Float[at.Array, "b emb"] | None,
+        "KVCache",
+        at.Bool[at.Array, "b s"],
+        int,
+    ]:
+        """Unified state-side accessor: every rep computable from ONE action-free prefix pass.
+
+        Returns (psi_rep, phi_rep, kv_cache, prefix_mask, prefix_len). The base model's psi is
+        the mean prefix embedding; its phi is action-dependent (suffix mean), so phi_rep is
+        None here — fetch it afterwards with get_phi_representation, reusing the kv_cache.
+        """
+        psi_rep, kv_cache, prefix_mask, prefix_len = self.get_prefix_mean_embedding(observation)
+        return psi_rep, None, kv_cache, prefix_mask, prefix_len
 
     def get_phi_representation(
         self,
@@ -341,9 +356,13 @@ class Pi0(_model.BaseModel):
         kv_cache,
         prefix_mask: at.Bool[at.Array, "b s"],
         prefix_len: int,
+        z: at.Float[at.Array, "b d"] | None = None,
     ) -> tuple[at.Float[at.Array, "*b emb"], at.Float[at.Array, "*b ah emb"], at.Float[at.Array, "*b ah ad"]]:
-        """Steering-compat alias: the base model's phi is the mean suffix embedding."""
-        return self.get_suffix_mean_embedding(observation, noisy_actions, timestep, kv_cache, prefix_mask, prefix_len)
+        """Action-conditioned rep from a suffix pass: the base model's phi is the mean suffix
+        embedding. Returns (phi_rep, action_hidden, v_t)."""
+        return self.get_suffix_mean_embedding(
+            observation, noisy_actions, timestep, kv_cache, prefix_mask, prefix_len, z=z
+        )
 
     def get_prefix_cache(
         self, observation: _model.Observation

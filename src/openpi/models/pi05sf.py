@@ -97,7 +97,10 @@ class Pi0SF(Pi0RepBase):
 
         # Task latent z (detached): B(future) for a fraction of the batch, random for the rest.
         # z = B(future): use the already-forwarded future_observation (no train-loop change).
-        z_goal = jax.lax.stop_gradient(self.get_psi_representation(future_observation)[0])
+        psi_goal = self.get_state_representations(future_observation)[0]
+        if psi_goal is None:
+            raise ValueError("Pi0SF's z = B(future) requires psi_input='state'")
+        z_goal = jax.lax.stop_gradient(psi_goal)
         z, z_goal_frac = self.sample_mixed_z(z_goal, z_rng)
         z_stacked = jnp.concatenate([z, z], axis=0)  # same z for the [obs, next] stack halves
 
