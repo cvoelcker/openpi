@@ -269,12 +269,19 @@ class Pi0SP(Pi0RepBase):
         # Margin: mean off-diagonal distance minus the true-pair distance (positive = aligned).
         diag_dist = sq_dists[labels, labels]
         off_diag_mean = (jnp.sum(sq_dists, axis=-1) - diag_dist) / jnp.maximum(batch_size - 1, 1)
+        # Normalized rank of the true target: fraction of distractors strictly closer than it.
+        # 0 = true target closest, ~0.5 = chance, 1 = worst. Unlike top-1 accuracy this is
+        # comparable across batch sizes (acc mechanically drops as distractors are added).
+        align_rank = jnp.sum(sq_dists < diag_dist[:, None], axis=-1).astype(jnp.float32) / jnp.maximum(
+            batch_size - 1, 1
+        )
         # Rows with a padded next frame have no valid target; exclude them from the averages.
         valid = not_terminal[:, 0]
         n_valid = jnp.maximum(jnp.sum(valid), 1.0)
         align_ce = jnp.sum(valid * align_ce) / n_valid
         align_acc = jnp.sum(valid * align_acc) / n_valid
         align_margin = jnp.sum(valid * (off_diag_mean - diag_dist)) / n_valid
+        align_rank = jnp.sum(valid * align_rank) / n_valid
 
         # phi SigREP loss: LeJEPA's SIGReg on the (grad-carrying) current-half phi. Pushing
         # every random 1D projection of the batch toward N(0, 1) drives the embedding
@@ -296,6 +303,11 @@ class Pi0SP(Pi0RepBase):
             "action_loss": jnp.mean(action_loss),
             "sp_loss": sp_loss,
             "sigrep_loss": sigrep_loss,
+            # Batch-size-independent Epps-Pulley statistic (classical n-scaling). Under
+            # perfect Gaussianity this converges to the estimator's sampling-noise floor
+            # of 1 - 1/sqrt(3) ~= 0.42 (for large t_max) regardless of batch size; values
+            # well above that indicate genuine non-Gaussianity.
+            "sigrep_loss_scaled": batch_size * sigrep_loss,
             "phi_norm": jnp.mean(jnp.linalg.norm(phi, axis=-1)),
             "target_norm": jnp.mean(jnp.linalg.norm(phi_next, axis=-1)),
             "phi_std": jnp.mean(jnp.std(phi, axis=0)),
@@ -304,6 +316,7 @@ class Pi0SP(Pi0RepBase):
             "sp_align_ce": align_ce,
             "sp_align_acc": align_acc,
             "sp_align_margin": align_margin,
+            "sp_align_rank": align_rank,
             "phi_mix_entropy": -jnp.sum(phi_mix_w * jnp.log(phi_mix_w + 1e-6)),
             "phi_mix_max": jnp.max(phi_mix_w),
         }

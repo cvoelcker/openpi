@@ -311,7 +311,7 @@ class Pi0SPConfig(Pi0RepBaseConfig):
     # regularization of the phi distribution), the anti-collapse complement to the MSE.
     # 0.0 disables it. Note the Epps-Pulley statistic is small (bounded, CF-scale), so this
     # coefficient typically wants to be >> the MSE's.
-    sigrep_loss_coeff: float = 1.0
+    sigrep_loss_coeff: float = 0.1
     # SIGReg sketch/quadrature: number of random 1D projections (resampled every step), and
     # the Epps-Pulley integration grid over t in [-sigrep_t_max, sigrep_t_max]. The N(0,1)
     # weight makes tails beyond |t|~4 negligible.

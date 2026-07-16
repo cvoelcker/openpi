@@ -1222,7 +1222,6 @@ _CONFIGS = [
         save_interval=5000,
         keep_period=10_000,
     ),
-
     TrainConfig(
         name="pi05_crl_libero_full_finetune",
         model=pi0_config.Pi0CRLConfig(
@@ -1247,7 +1246,6 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=30_000,
     ),
-
     TrainConfig(
         # Pure representation learning on a frozen backbone: rep_dim=2048 phi/psi heads,
         # action loss off and no rep-loss leak into the backbone (action_loss_coeff=0.0,
@@ -1293,7 +1291,6 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_libero/params"),
         num_train_steps=30_000,
     ),
-
     TrainConfig(
         # Leaner-head variant of ..._frozen to test whether the train<<val rep gap is head
         # over-capacity (memorization) rather than the same-episode collision artifact — the
@@ -1337,7 +1334,6 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_libero/params"),
         num_train_steps=30_000,
     ),
-
     TrainConfig(
         # Randomization test (Zhang et al. 2017) on the frozen_lite setup: identical model/optimizer,
         # but the CRL positive is a FIXED random cross-episode frame (random_future_control=True),
@@ -1384,7 +1380,6 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_libero/params"),
         num_train_steps=30_000,
     ),
-
     TrainConfig(
         # Self-prediction (Pi0SP) analogue of pi05_crl_libero_full_finetune_frozen: pure
         # representation learning on a frozen backbone (action_loss_coeff=0.0,
@@ -1432,7 +1427,6 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_libero/params"),
         num_train_steps=30_000,
     ),
-
     TrainConfig(
         name="pi05_crl_libero_full_finetune_pretrained",
         model=pi0_config.Pi0CRLConfig(
@@ -1457,7 +1451,6 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_libero/params"),
         num_train_steps=30_000,
     ),
-
     # phi_input="state" variants: phi joins psi on the prefix, so both CRL reps
     # are action-independent. Checkpoints are NOT weight-compatible with the
     # default (suffix-phi) configs above — phi_head/phi_proj widths differ.
@@ -1486,7 +1479,6 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=30_000,
     ),
-
     TrainConfig(
         name="pi05_crl_libero_full_finetune_pretrained_state_phi",
         model=pi0_config.Pi0CRLConfig(
@@ -1512,7 +1504,6 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_libero/params"),
         num_train_steps=30_000,
     ),
-
     #
     # ALOHA Sim configs. This config is used to demonstrate how to train on a simple simulated environment.
     #
