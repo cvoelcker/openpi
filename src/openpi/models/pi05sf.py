@@ -21,6 +21,7 @@ from typing_extensions import override
 from openpi.models import model as _model
 from openpi.models import pi0_config
 from openpi.models.rep_base import Pi0RepBase
+from openpi.models.rep_base import batch_rep_stats
 from openpi.shared import array_typing as at
 
 logger = logging.getLogger("openpi")
@@ -299,6 +300,10 @@ class Pi0SF(Pi0RepBase):
             "psi_offdiag_cossim": psi_offdiag_cossim,
             "psi_norm": jnp.mean(jnp.linalg.norm(psi, axis=-1)),
             "phi_norm": jnp.mean(jnp.linalg.norm(phi_sa, axis=-1)),
+            # Across-batch mean/std of each rep (collapse -> std to 0). psi is L2-normalized,
+            # so its std tracks directional spread; phi_sa is raw.
+            **batch_rep_stats(psi, "psi"),
+            **batch_rep_stats(phi_sa, "phi"),
             "sf_td_resid": jnp.mean(jnp.linalg.norm(td_resid, axis=-1)),
             "z_goal_frac": z_goal_frac,
             "phi_mix_entropy": -jnp.sum(phi_mix_w * jnp.log(phi_mix_w + 1e-6)),

@@ -17,6 +17,7 @@ from openpi.models import model as _model
 from openpi.models import pi0_config
 from openpi.models.rep_base import Pi0RepBase
 from openpi.models.rep_base import _l2_normalize
+from openpi.models.rep_base import batch_rep_stats
 from openpi.shared import array_typing as at
 
 logger = logging.getLogger("openpi")
@@ -190,6 +191,9 @@ class Pi0CRL(Pi0RepBase):
         diagnostics = {
             "phi_norm": jnp.mean(jnp.linalg.norm(phi_raw, axis=-1)),
             "psi_norm": jnp.mean(jnp.linalg.norm(psi_raw, axis=-1)),
+            # Across-batch mean/std of the pre-normalization reps (collapse -> std to 0).
+            **batch_rep_stats(phi_raw, "phi"),
+            **batch_rep_stats(psi_raw, "psi"),
             "temperature": 1.0 / logit_scale,
             "phi_mix_entropy": -jnp.sum(phi_mix_w * jnp.log(phi_mix_w + 1e-6)),
             "psi_mix_entropy": -jnp.sum(psi_mix_w * jnp.log(psi_mix_w + 1e-6)),

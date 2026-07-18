@@ -44,6 +44,20 @@ def _l2_normalize(x, eps: float = 1e-6):
     return x / (jnp.linalg.norm(x, axis=-1, keepdims=True) + eps)
 
 
+def batch_rep_stats(rep, name: str) -> dict[str, at.Array]:
+    """Across-batch (axis=0, NOT within-sample) collapse diagnostics for a [b, d] rep.
+
+    `{name}_std` is the mean over features of each feature's std across the batch -> 0 as the
+    rep collapses to a batch-constant. `{name}_mean_norm` is the norm of the batch-mean rep; a
+    large mean offset can sit under a healthy std, so both are tracked together.
+    """
+    rep = rep.astype(jnp.float32)
+    return {
+        f"{name}_std": jnp.mean(jnp.std(rep, axis=0)),
+        f"{name}_mean_norm": jnp.linalg.norm(jnp.mean(rep, axis=0)),
+    }
+
+
 class _RepHead(nn.Module):
     """Attention-pooling head: reuses gemma Blocks to pool a layer-mixed backbone
     token sequence into a single vector via a learned query token."""

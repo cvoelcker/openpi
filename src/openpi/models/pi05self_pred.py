@@ -32,6 +32,7 @@ from typing_extensions import override
 from openpi.models import model as _model
 from openpi.models import pi0_config
 from openpi.models.rep_base import Pi0RepBase
+from openpi.models.rep_base import batch_rep_stats
 from openpi.shared import array_typing as at
 
 logger = logging.getLogger("openpi")
@@ -197,7 +198,15 @@ class Pi0SP(Pi0RepBase):
         next_is_pad = batch.get("next_is_pad")
 
         # Head dropout only touches phi's current half (the target is deterministic).
-        preprocess_rng, next_preprocess_rng, noise_rng, time_rng, phi_drop_rng, sigrep_rng = jax.random.split(rng, 6)
+        (
+            preprocess_rng,
+            next_preprocess_rng,
+            noise_rng,
+            time_rng,
+            phi_drop_rng,
+            sigrep_rng,
+            rand_act_rng,
+        ) = jax.random.split(rng, 7)
         deterministic = not train
         # Augment current/next independently (consistent with pi05crl) so phi(s,a) and the
         # bootstrap phi(s',a') cannot match on shared augmentation artifacts.
@@ -283,6 +292,20 @@ class Pi0SP(Pi0RepBase):
         align_margin = jnp.sum(valid * (off_diag_mean - diag_dist)) / n_valid
         align_rank = jnp.sum(valid * align_rank) / n_valid
 
+        # ---- Action-usage diagnostic: sp_loss under uniform-noise actions ----
+        # If the forward model ignores `a`, sp_loss with random actions matches sp_loss with
+        # the real ones and the ratio sits near 1 — meaning action-conditioning is nominal
+        # and the predictor is effectively self-predictive. A ratio well above 1 means the
+        # actions carry real information for the target. Fully stop-gradient; diagnostic only.
+        rand_actions = jax.random.uniform(rand_act_rng, actions.shape, minval=-1.0, maxval=1.0)
+        phi_sa_rand = jnp.concatenate(
+            [jax.lax.stop_gradient(phi), rand_actions.reshape(batch_size, -1)], axis=-1
+        )
+        phi_pred_rand = jax.lax.stop_gradient(self.forward_proj(phi_sa_rand))
+        sp_resid_rand = not_terminal * (phi_pred_rand - phi_next)
+        sp_loss_rand = jnp.mean(jnp.square(sp_resid_rand))
+        sp_loss_ratio_rand = sp_loss_rand / (sp_loss + 1e-8)
+
         # phi SigREP loss: LeJEPA's SIGReg on the (grad-carrying) current-half phi. Pushing
         # every random 1D projection of the batch toward N(0, 1) drives the embedding
         # distribution to an isotropic Gaussian — the anti-collapse complement to the MSE
@@ -310,9 +333,11 @@ class Pi0SP(Pi0RepBase):
             "sigrep_loss_scaled": batch_size * sigrep_loss,
             "phi_norm": jnp.mean(jnp.linalg.norm(phi, axis=-1)),
             "target_norm": jnp.mean(jnp.linalg.norm(phi_next, axis=-1)),
-            "phi_std": jnp.mean(jnp.std(phi, axis=0)),
-            "phi_mean_norm": jnp.linalg.norm(jnp.mean(phi, axis=0)),
+            **batch_rep_stats(phi, "phi"),
+            **batch_rep_stats(phi_next, "target"),
             "sp_resid": jnp.mean(jnp.linalg.norm(sp_resid, axis=-1)),
+            "sp_loss_rand_actions": sp_loss_rand,
+            "sp_loss_ratio_rand": sp_loss_ratio_rand,
             "sp_align_ce": align_ce,
             "sp_align_acc": align_acc,
             "sp_align_margin": align_margin,
