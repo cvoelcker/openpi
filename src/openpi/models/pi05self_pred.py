@@ -2,12 +2,15 @@
 
 Pi0SP trains the phi readout with a latent forward model: a BRO-style residual MLP
 (ForwardProjHead) predicts the next-step rep from (phi(s), a). The prediction is trained
-with (1) an MSE regression onto a target rep of s' and (2) SigREP, LeJEPA's SIGReg
-(sketched isotropic-Gaussian regularization): random 1D projections of the phi embeddings
-are pushed toward N(0, 1) via the Epps-Pulley characteristic-function test. An
-isotropic-Gaussian embedding distribution rules out the constant-rep (and any
-low-dimensional) collapse that the regression alone admits — without negatives, a
-temperature, or other contrastive machinery.
+with (1) an MSE regression onto a target rep of s' and (2) sigreg, LeJEPA's SIGReg
+(sketched isotropic-Gaussian regularization): random 1D projections of a small MLP
+head on top of phi are pushed toward N(0, 1) via the Epps-Pulley characteristic-function
+test. Following LeJEPA (and issue #17 on the LeJEPA repo), the isotropy constraint is
+applied to a projector output rather than directly to phi — the projector absorbs the
+unit-variance / all-directions constraint, letting phi concentrate variance on the
+directions the forward-model target actually rewards. Isotropy at the projector still
+rules out the constant-rep collapse of the regression (a collapsed phi cannot yield an
+isotropic projection either).
 
 The target rep is, by default, psi(s') where psi is a frozen lagging (EMA) copy of phi — a
 BYOL/JEPA-style target network that stabilizes the bootstrap (the online net would otherwise
@@ -123,27 +126,42 @@ def _sigreg_epps_pulley(
 
 
 class Pi0SP(Pi0RepBase):
-    # phi must stay unnormalized: SIGReg drives its distribution to an isotropic Gaussian,
-    # which pins the scale — L2 normalization would fight the regularizer (and destroy the
-    # Gaussian shape). psi (the lagging EMA copy of phi, when built) mirrors phi's policy:
-    # the regression target must live in the same raw space.
+    # phi stays unnormalized: SIGReg now acts on a projector output rather than phi
+    # directly, but phi's scale is still pinned by the MSE regression onto the (lagging)
+    # target head, and L2-normalizing would still fight that regression. psi (the lagging
+    # EMA copy of phi, when built) mirrors phi's policy: the regression target must live
+    # in the same raw space.
     _normalize_phi = False
     _normalize_psi = False
 
     def __init__(self, config: pi0_config.Pi0SPConfig, rngs: nnx.Rngs):
         super().__init__(config, rngs)
         self.sp_loss_coeff = config.sp_loss_coeff
-        self.sigrep_loss_coeff = config.sigrep_loss_coeff
+        self.sigreg_loss_coeff = config.sigreg_loss_coeff
         # z conditions the action expert via the AdaRMS pathway (keeps the prefix z-free).
         # Unused by compute_loss (no z is passed); kept for inference-time steering.
         self.z_proj = nnx.Linear(config.rep_dim, self.action_in_proj.out_features, rngs=rngs)
 
         self.forward_proj = ForwardProjHead(config, rngs)
 
+        # 2-layer projection head that absorbs the SIGReg isotropy constraint (issue #17
+        # on the LeJEPA repo). Same output dim as phi so it acts as a JEPA-style
+        # predictor head rather than a low-dim bottleneck. Only gets gradients from the
+        # SIGReg term — the forward-model / MSE path never sees it.
+        self.sigreg_proj_fc1 = nnx.Linear(config.rep_dim, config.rep_dim, rngs=rngs)
+        self.sigreg_proj_ln = nnx.LayerNorm(config.rep_dim, rngs=rngs)
+        self.sigreg_proj_fc2 = nnx.Linear(config.rep_dim, config.rep_dim, rngs=rngs)
+
         # SIGReg sketch/quadrature knobs (no learnable parameters).
-        self.sigrep_num_slices = config.sigrep_num_slices
-        self.sigrep_t_max = config.sigrep_t_max
-        self.sigrep_num_t = config.sigrep_num_t
+        self.sigreg_num_slices = config.sigreg_num_slices
+        self.sigreg_t_max = config.sigreg_t_max
+        self.sigreg_num_t = config.sigreg_num_t
+
+    def _sigreg_project(self, x: at.Float[at.Array, "b d"]) -> at.Float[at.Array, "b d"]:
+        h = self.sigreg_proj_fc1(x)
+        h = self.sigreg_proj_ln(h)
+        h = nnx.gelu(h)
+        return self.sigreg_proj_fc2(h)
 
     @override
     def _adarms_cond(
@@ -180,7 +198,7 @@ class Pi0SP(Pi0RepBase):
         *,
         train: bool = False,
     ) -> tuple[at.Float[at.Array, "*b ah"], dict[str, at.Array]]:
-        """Latent self-prediction loss (MSE onto the lagging-psi target + SigREP) + flow-matching action loss.
+        """Latent self-prediction loss (MSE onto the lagging-psi target + sigreg) + flow-matching action loss.
 
         Required batch keys: observation, actions, next_observation. phi is
         action-independent (phi_input="state", enforced by Pi0SPConfig), so no
@@ -204,7 +222,7 @@ class Pi0SP(Pi0RepBase):
             noise_rng,
             time_rng,
             phi_drop_rng,
-            sigrep_rng,
+            sigreg_rng,
             rand_act_rng,
         ) = jax.random.split(rng, 7)
         deterministic = not train
@@ -298,43 +316,44 @@ class Pi0SP(Pi0RepBase):
         # and the predictor is effectively self-predictive. A ratio well above 1 means the
         # actions carry real information for the target. Fully stop-gradient; diagnostic only.
         rand_actions = jax.random.uniform(rand_act_rng, actions.shape, minval=-1.0, maxval=1.0)
-        phi_sa_rand = jnp.concatenate(
-            [jax.lax.stop_gradient(phi), rand_actions.reshape(batch_size, -1)], axis=-1
-        )
+        phi_sa_rand = jnp.concatenate([jax.lax.stop_gradient(phi), rand_actions.reshape(batch_size, -1)], axis=-1)
         phi_pred_rand = jax.lax.stop_gradient(self.forward_proj(phi_sa_rand))
         sp_resid_rand = not_terminal * (phi_pred_rand - phi_next)
         sp_loss_rand = jnp.mean(jnp.square(sp_resid_rand))
         sp_loss_ratio_rand = sp_loss_rand / (sp_loss + 1e-8)
 
-        # phi SigREP loss: LeJEPA's SIGReg on the (grad-carrying) current-half phi. Pushing
-        # every random 1D projection of the batch toward N(0, 1) drives the embedding
-        # distribution to an isotropic Gaussian — the anti-collapse complement to the MSE
-        # (a constant or low-rank phi cannot be isotropic Gaussian). The stop-grad target
-        # half comes from the same head, so its distribution follows without an extra term.
-        sigrep_loss = _sigreg_epps_pulley(
-            phi,
-            sigrep_rng,
-            num_slices=self.sigrep_num_slices,
-            t_max=self.sigrep_t_max,
-            num_t=self.sigrep_num_t,
+        # phi sigreg loss: LeJEPA's SIGReg on a 2-layer projection of the (grad-carrying)
+        # current-half phi (issue #17 fix — the projector absorbs the unit-variance /
+        # all-directions constraint so phi is free to concentrate variance on the
+        # forward-model-relevant directions). Isotropy at the projector still forbids a
+        # constant / low-rank phi (a collapsed phi cannot yield an isotropic projection).
+        phi_sigreg = self._sigreg_project(phi)
+        sigreg_loss = _sigreg_epps_pulley(
+            phi_sigreg,
+            sigreg_rng,
+            num_slices=self.sigreg_num_slices,
+            t_max=self.sigreg_t_max,
+            num_t=self.sigreg_num_t,
         )
 
         # Diagnostics (meaned by the train loop); layer-mix entropy watches for mix collapse.
-        # phi_std -> 1 and phi_mean_norm -> 0 as SIGReg pulls phi toward N(0, I).
+        # sigreg_std -> 1 and sigreg_mean_norm -> 0 as SIGReg pulls the projector output
+        # (not phi itself, post issue-#17 fix) toward N(0, I).
         phi_mix_w = jax.nn.softmax(self.phi_mix.value.astype(jnp.float32))
         info = {
             "action_loss": jnp.mean(action_loss),
             "sp_loss": sp_loss,
-            "sigrep_loss": sigrep_loss,
+            "sigreg_loss": sigreg_loss,
             # Batch-size-independent Epps-Pulley statistic (classical n-scaling). Under
             # perfect Gaussianity this converges to the estimator's sampling-noise floor
             # of 1 - 1/sqrt(3) ~= 0.42 (for large t_max) regardless of batch size; values
             # well above that indicate genuine non-Gaussianity.
-            "sigrep_loss_scaled": batch_size * sigrep_loss,
+            "sigreg_loss_scaled": batch_size * sigreg_loss,
             "phi_norm": jnp.mean(jnp.linalg.norm(phi, axis=-1)),
             "target_norm": jnp.mean(jnp.linalg.norm(phi_next, axis=-1)),
             **batch_rep_stats(phi, "phi"),
             **batch_rep_stats(phi_next, "target"),
+            **batch_rep_stats(phi_sigreg, "sigreg"),
             "sp_resid": jnp.mean(jnp.linalg.norm(sp_resid, axis=-1)),
             "sp_loss_rand_actions": sp_loss_rand,
             "sp_loss_ratio_rand": sp_loss_ratio_rand,
@@ -346,8 +365,8 @@ class Pi0SP(Pi0RepBase):
             "phi_mix_max": jnp.max(phi_mix_w),
         }
         total_loss = (
-            self.action_loss_coeff * action_loss + self.sp_loss_coeff * sp_loss + self.sigrep_loss_coeff * sigrep_loss
+            self.action_loss_coeff * action_loss + self.sp_loss_coeff * sp_loss + self.sigreg_loss_coeff * sigreg_loss
         )
         # "rep_loss" (the combined, unweighted rep objective) keeps the train loop's shared
         # logging (which expects the CRL model's key set) working unchanged.
-        return total_loss, {"rep_loss": sp_loss + sigrep_loss, **info}
+        return total_loss, {"rep_loss": sp_loss + sigreg_loss, **info}

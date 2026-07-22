@@ -288,7 +288,7 @@ class Pi0SPConfig(Pi0RepBaseConfig):
     """Config for the Self-Prediction variant of Pi0.
 
     Instantiates pi05self_pred.Pi0SP, which trains the phi head with a latent self-prediction
-    loss (MSE + SigREP) alongside the flow-matching action loss. With the default
+    loss (MSE + sigreg) alongside the flow-matching action loss. With the default
     psi_lagging_ema, psi is a frozen lagging (EMA) copy of phi that provides the
     self-prediction target — a BYOL/JEPA-style target network that stabilizes the bootstrap.
     With psi_lagging_ema=None the psi trio is not built and the target is the stop-gradient
@@ -307,17 +307,17 @@ class Pi0SPConfig(Pi0RepBaseConfig):
     psi_input: str = "state"
     sp_loss_coeff: float = 1.0  # Weight on the self-prediction (MSE) loss
     forward_proj_blocks: int = 2  # Number of BRO blocks in the forward projection head
-    # Weight on the SigREP loss — LeJEPA's SIGReg (sketched isotropic-Gaussian
+    # Weight on the sigreg loss — LeJEPA's SIGReg (sketched isotropic-Gaussian
     # regularization of the phi distribution), the anti-collapse complement to the MSE.
     # 0.0 disables it. Note the Epps-Pulley statistic is small (bounded, CF-scale), so this
     # coefficient typically wants to be >> the MSE's.
-    sigrep_loss_coeff: float = 0.1
+    sigreg_loss_coeff: float = 0.1
     # SIGReg sketch/quadrature: number of random 1D projections (resampled every step), and
-    # the Epps-Pulley integration grid over t in [-sigrep_t_max, sigrep_t_max]. The N(0,1)
+    # the Epps-Pulley integration grid over t in [-sigreg_t_max, sigreg_t_max]. The N(0,1)
     # weight makes tails beyond |t|~4 negligible.
-    sigrep_num_slices: int = 512
-    sigrep_t_max: float = 4.0
-    sigrep_num_t: int = 17
+    sigreg_num_slices: int = 512
+    sigreg_t_max: float = 4.0
+    sigreg_num_t: int = 17
 
     def __post_init__(self):
         # psi exists exactly when it serves as the lagging target (SP has no other psi use).
@@ -333,7 +333,7 @@ class Pi0SPConfig(Pi0RepBaseConfig):
     def get_freeze_filter(self) -> nnx.filterlib.Filter:
         # Same regime as Pi0RepBaseConfig, but forward_proj must stay trainable too: it takes
         # the (trainable) phi head's output, so it trains even with a frozen backbone.
-        # SigREP itself has no learnable parameters.
+        # sigreg itself has no learnable parameters.
         if self.backbone_frozen:
             trainable = nnx_utils.PathRegex(r".*((phi|psi)_(head|mix|proj)|forward_proj).*")
             return nnx.Not(trainable)
