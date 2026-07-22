@@ -53,13 +53,17 @@ class BROBlock(nnx.Module):
         self.fc2 = nnx.Linear(latent_dim, latent_dim, rngs=rngs)
         self.ln2 = nnx.LayerNorm(latent_dim, rngs=rngs)
 
-    def __call__(self, x: at.Float[at.Array, "b d"]) -> at.Float[at.Array, "b d"]:
+        self.film_gamma = nnx.Linear(latent_dim, latent_dim, rngs=rngs)
+
+    def __call__(self, x: at.Float[at.Array, "b d"], a: at.Float[at.Array, "b d"]) -> at.Float[at.Array, "b d"]:
         residual = x
         x = self.fc1(x)
         x = self.ln1(x)
         x = nnx.gelu(x)
         x = self.fc2(x)
         x = self.ln2(x)
+        beta = self.film_beta(a)
+        x = x + beta
         return x + residual
 
 
@@ -74,21 +78,36 @@ class ForwardProjHead(nnx.Module):
 
     def __init__(self, config: pi0_config.Pi0SPConfig, rngs: nnx.Rngs):
         blocks = config.forward_proj_blocks
-        input_dim = config.rep_dim + config.action_dim * config.action_horizon
         latent_dim = config.rep_dim
-        self.fc1 = nnx.Linear(input_dim, latent_dim, rngs=rngs)
-        self.ln1 = nnx.LayerNorm(latent_dim, rngs=rngs)
+        # state embedding
+        self.fc1 = nnx.Sequential(
+            [
+                nnx.Linear(latent_dim, latent_dim, rngs=rngs),
+                nnx.LayerNorm(latent_dim, rngs=rngs),
+                nnx.gelu,
+                nnx.Linear(latent_dim, latent_dim, rngs=rngs),
+            ]
+        )
+        # action embedding
+        self.action_embed = nnx.Sequential(
+            [
+                nnx.Linear(config.action_dim * config.action_horizon, config.rep_dim, rngs=rngs),
+                nnx.LayerNorm(config.rep_dim, rngs=rngs),
+                nnx.gelu,
+                nnx.Linear(config.rep_dim, config.rep_dim, rngs=rngs),
+                nnx.LayerNorm(config.rep_dim, rngs=rngs),
+            ]
+        )
         # String-keyed nnx.Dict, NOT a plain list: list entries get integer path keys in
         # the param tree, which breaks the "/"-joined flatten in weight_loaders._merge_params.
         self.num_blocks = blocks
         self.block_list = nnx.Dict({f"block_{i}": BROBlock(latent_dim, rngs) for i in range(blocks)})
 
-    def __call__(self, x: at.Float[at.Array, "b d"]) -> at.Float[at.Array, "b d"]:
+    def __call__(self, x: at.Float[at.Array, "b d"], a: at.Float[at.Array, "b ad"]) -> at.Float[at.Array, "b d"]:
         x = self.fc1(x)
-        x = self.ln1(x)
-        x = nnx.gelu(x)
+        a = self.action_embed(a)
         for i in range(self.num_blocks):
-            x = self.block_list[f"block_{i}"](x)
+            x = self.block_list[f"block_{i}"](x, a)
         return x
 
 
@@ -266,8 +285,7 @@ class Pi0SP(Pi0RepBase):
         nxt = slice(batch_size, None)
         phi = _rep_slice("phi", cur, phi_drop_rng, det=deterministic).astype(jnp.float32)
         # Actions are flattened to (b, ah*ad) to concat with the (b, d) rep.
-        phi_sa = jnp.concatenate([phi, actions.reshape(batch_size, -1)], axis=-1)
-        phi_pred = self.forward_proj(phi_sa)
+        phi_pred = self.forward_proj(phi, actions.reshape(batch_size, -1))
         # Prediction target: the lagging EMA psi(s') when the target network is enabled
         # (psi gets no gradients anyway, but stop_gradient also severs the backbone path
         # through the next-half hiddens), else the stop-gradient online phi(s').
