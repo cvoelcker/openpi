@@ -53,7 +53,7 @@ class BROBlock(nnx.Module):
         self.fc2 = nnx.Linear(latent_dim, latent_dim, rngs=rngs)
         self.ln2 = nnx.LayerNorm(latent_dim, rngs=rngs)
 
-        self.film_gamma = nnx.Linear(latent_dim, latent_dim, rngs=rngs)
+        self.film_beta = nnx.Linear(latent_dim, latent_dim, rngs=rngs)
 
     def __call__(self, x: at.Float[at.Array, "b d"], a: at.Float[at.Array, "b d"]) -> at.Float[at.Array, "b d"]:
         residual = x
@@ -79,33 +79,33 @@ class ForwardProjHead(nnx.Module):
     def __init__(self, config: pi0_config.Pi0SPConfig, rngs: nnx.Rngs):
         blocks = config.forward_proj_blocks
         latent_dim = config.rep_dim
-        # state embedding
-        self.fc1 = nnx.Sequential(
-            [
-                nnx.Linear(latent_dim, latent_dim, rngs=rngs),
-                nnx.LayerNorm(latent_dim, rngs=rngs),
-                nnx.gelu,
-                nnx.Linear(latent_dim, latent_dim, rngs=rngs),
-            ]
-        )
-        # action embedding
-        self.action_embed = nnx.Sequential(
-            [
-                nnx.Linear(config.action_dim * config.action_horizon, config.rep_dim, rngs=rngs),
-                nnx.LayerNorm(config.rep_dim, rngs=rngs),
-                nnx.gelu,
-                nnx.Linear(config.rep_dim, config.rep_dim, rngs=rngs),
-                nnx.LayerNorm(config.rep_dim, rngs=rngs),
-            ]
-        )
-        # String-keyed nnx.Dict, NOT a plain list: list entries get integer path keys in
-        # the param tree, which breaks the "/"-joined flatten in weight_loaders._merge_params.
+        self.state_fc1 = nnx.Linear(latent_dim, latent_dim, rngs=rngs)
+        self.state_ln1 = nnx.LayerNorm(latent_dim, rngs=rngs)
+        self.state_fc2 = nnx.Linear(latent_dim, latent_dim, rngs=rngs)
+        action_in = config.action_dim * config.action_horizon
+        self.action_fc1 = nnx.Linear(action_in, config.rep_dim, rngs=rngs)
+        self.action_ln1 = nnx.LayerNorm(config.rep_dim, rngs=rngs)
+        self.action_fc2 = nnx.Linear(config.rep_dim, config.rep_dim, rngs=rngs)
+        self.action_ln2 = nnx.LayerNorm(config.rep_dim, rngs=rngs)
         self.num_blocks = blocks
         self.block_list = nnx.Dict({f"block_{i}": BROBlock(latent_dim, rngs) for i in range(blocks)})
 
+    def _embed_state(self, x: at.Float[at.Array, "b d"]) -> at.Float[at.Array, "b d"]:
+        x = self.state_fc1(x)
+        x = self.state_ln1(x)
+        x = nnx.gelu(x)
+        return self.state_fc2(x)
+
+    def _embed_action(self, a: at.Float[at.Array, "b ad"]) -> at.Float[at.Array, "b d"]:
+        a = self.action_fc1(a)
+        a = self.action_ln1(a)
+        a = nnx.gelu(a)
+        a = self.action_fc2(a)
+        return self.action_ln2(a)
+
     def __call__(self, x: at.Float[at.Array, "b d"], a: at.Float[at.Array, "b ad"]) -> at.Float[at.Array, "b d"]:
-        x = self.fc1(x)
-        a = self.action_embed(a)
+        x = self._embed_state(x)
+        a = self._embed_action(a)
         for i in range(self.num_blocks):
             x = self.block_list[f"block_{i}"](x, a)
         return x
