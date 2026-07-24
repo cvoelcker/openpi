@@ -1,8 +1,8 @@
 source .venv/bin/activate
 
 args=(
-  pi05_crl_libero_full_finetune_pretrained_state_phi
-  --exp-name=full_crl_rep_pretrained_state_phi    # checkpoint/W&B run name
+  pi05_sp_libero_full_finetune_frozen
+  --exp-name=debug # checkpoint/W&B run name
   --overwrite                           # replace existing checkpoint dir
   # --data.no-include-next-observation    # skip unused HER next obs
   # --data.no-include-goal-observation    # skip unused HER goal obs
@@ -10,10 +10,10 @@ args=(
   # --data.num-parallel-calls=8           # 8 is the verified max on 1 node so far
   # --data.no-filter                      # disable DROID filter ranges
   # --data.shuffle-buffer-size=50000      # 50000 won't OOM on 1 node
-  --batch-size=28
+  --batch-size=4
   --save-interval=2500                # skip periodic save (will save at last train step)
   --num-train-steps=50000
 )
 # Run compute_norm_stats first if norm stats for this config name don't exist yet:
 # python scripts/compute_norm_stats.py --config-name="${args[0]}"
-XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 python scripts/train_rep.py "${args[@]}"
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 python scripts/train.py "${args[@]}"

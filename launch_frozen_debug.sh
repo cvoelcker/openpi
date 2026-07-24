@@ -1,8 +1,8 @@
 source .venv/bin/activate
 
 args=(
-  pi05_crl_libero_full_finetune_pretrained_state_phi
-  --exp-name=full_crl_rep_pretrained_state_phi    # checkpoint/W&B run name
+  pi05_crl_libero_full_finetune_frozen_debug
+  --exp-name=debug # checkpoint/W&B run name
   --overwrite                           # replace existing checkpoint dir
   # --data.no-include-next-observation    # skip unused HER next obs
   # --data.no-include-goal-observation    # skip unused HER goal obs
@@ -10,7 +10,7 @@ args=(
   # --data.num-parallel-calls=8           # 8 is the verified max on 1 node so far
   # --data.no-filter                      # disable DROID filter ranges
   # --data.shuffle-buffer-size=50000      # 50000 won't OOM on 1 node
-  --batch-size=28
+  --batch-size=8
   --save-interval=2500                # skip periodic save (will save at last train step)
   --num-train-steps=50000
 )

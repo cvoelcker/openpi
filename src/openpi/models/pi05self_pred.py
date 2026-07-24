@@ -45,6 +45,8 @@ class BROBlock(nnx.Module):
     """A BRO-style residual block with a linear layer, layer norm, and GELU activation.
     The input is added to the output to form the final output. This is used in the ForwardProjHead
     to ease learning the identity function when the action is not informative.
+
+    WARNING: temporally changed to non reidual for experiment
     """
 
     def __init__(self, latent_dim: int, rngs: nnx.Rngs):
@@ -72,8 +74,7 @@ class ForwardProjHead(nnx.Module):
 
     The input is the concatenation of the state rep and the flattened action sequence; the
     output lives in the same rep_dim space as phi so it can be regressed / contrasted against
-    phi(s'). BRO-style residual blocks ease learning the identity function when the action is
-    not informative.
+    phi(s').
     """
 
     def __init__(self, config: pi0_config.Pi0SPConfig, rngs: nnx.Rngs):
@@ -334,8 +335,7 @@ class Pi0SP(Pi0RepBase):
         # and the predictor is effectively self-predictive. A ratio well above 1 means the
         # actions carry real information for the target. Fully stop-gradient; diagnostic only.
         rand_actions = jax.random.uniform(rand_act_rng, actions.shape, minval=-1.0, maxval=1.0)
-        phi_sa_rand = jnp.concatenate([jax.lax.stop_gradient(phi), rand_actions.reshape(batch_size, -1)], axis=-1)
-        phi_pred_rand = jax.lax.stop_gradient(self.forward_proj(phi_sa_rand))
+        phi_pred_rand = jax.lax.stop_gradient(self.forward_proj(jax.lax.stop_gradient(phi), rand_actions.reshape(batch_size, -1)))
         sp_resid_rand = not_terminal * (phi_pred_rand - phi_next)
         sp_loss_rand = jnp.mean(jnp.square(sp_resid_rand))
         sp_loss_ratio_rand = sp_loss_rand / (sp_loss + 1e-8)

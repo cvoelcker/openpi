@@ -298,7 +298,8 @@ class Pi0SPConfig(Pi0RepBaseConfig):
     # EMA decay of the lagging psi target (see Pi0RepBaseConfig.psi_lagging_ema). None
     # disables the target network entirely: no psi trio, stop-gradient online targets.
     # enable_psi_head is derived from this in __post_init__ — do not set it directly.
-    psi_lagging_ema: float | None = 0.995
+    forward_proj_blocks: int = 2  # Number of BRO blocks in the forward projection head
+    psi_lagging_ema: float | None = 0.999
     # phi must be action-independent ("state"): the actions enter the forward model
     # explicitly, concatenated to phi(s) in ForwardProjHead. A suffix ("state_action") phi
     # would leak the action into both the input rep and the prediction target.
@@ -306,12 +307,7 @@ class Pi0SPConfig(Pi0RepBaseConfig):
     phi_input: str = "state"
     psi_input: str = "state"
     sp_loss_coeff: float = 1.0  # Weight on the self-prediction (MSE) loss
-    forward_proj_blocks: int = 2  # Number of BRO blocks in the forward projection head
-    # Weight on the sigreg loss — LeJEPA's SIGReg (sketched isotropic-Gaussian
-    # regularization of the phi distribution), the anti-collapse complement to the MSE.
-    # 0.0 disables it. Note the Epps-Pulley statistic is small (bounded, CF-scale), so this
-    # coefficient typically wants to be >> the MSE's.
-    sigreg_loss_coeff: float = 0.1
+    sigreg_loss_coeff: float = 0.05
     # SIGReg sketch/quadrature: number of random 1D projections (resampled every step), and
     # the Epps-Pulley integration grid over t in [-sigreg_t_max, sigreg_t_max]. The N(0,1)
     # weight makes tails beyond |t|~4 negligible.
