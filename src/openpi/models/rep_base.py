@@ -50,26 +50,84 @@ def batch_rep_stats(rep, name: str) -> dict[str, at.Array]:
     `{name}_std` is the mean over features of each feature's std across the batch -> 0 as the
     rep collapses to a batch-constant. `{name}_mean_norm` is the norm of the batch-mean rep; a
     large mean offset can sit under a healthy std, so both are tracked together.
+
+    Those two are scale-DEPENDENT, which makes them ambiguous whenever nothing in the loss
+    pins ||rep|| (e.g. Pi0SP with normalize_sp_loss=True, where the regression is scale-
+    invariant): a shrinking `_std` can mean either collapse or a harmless global rescale. The
+    remaining three are scale-INVARIANT and disambiguate it:
+
+    - `{name}_eff_rank`: participation ratio of the covariance spectrum, (tr S)^2 / tr(S^2),
+      in [1, min(b, d)]. An effective count of active directions -> 1 under collapse.
+      Computed WITHOUT an eigendecomposition: both traces are Frobenius norms, so this costs
+      one b x b Gram matmul (~1e-7 of a training step) instead of an eigensolver, which on
+      GPU is a serial kernel and — for the non-symmetric case — has no lowering at all.
+    - `{name}_eff_rank_frac`: the same, normalized to [0, 1] so it is comparable across
+      rep_dim and batch size.
+    - `{name}_offdiag_cos`: mean off-diagonal cosine similarity, -> 1 under directional
+      collapse (which a healthy per-feature std can still hide).
+
+    `scripts/eval_rep_stats.py` reports the same quantities offline over a pooled sample.
     """
     rep = rep.astype(jnp.float32)
+    b = rep.shape[0]
+
+    centered = rep - jnp.mean(rep, axis=0, keepdims=True)
+    # (tr S)^2 / tr(S^2) with S the covariance. tr(S) = ||X||_F^2 / b and, since X X^T is
+    # symmetric, tr(S^2) = ||X X^T||_F^2 / b^2 — no eigensolver needed. The Gram is taken on
+    # the batch axis (b < d here), so this is a small b x b matmul, not a d x d covariance.
+    #
+    # X is rescaled to unit Frobenius norm first. The b factors and the overall scale cancel
+    # algebraically, but NOT numerically: with a fixed epsilon in the denominator, a rep whose
+    # magnitude drifts down (which is exactly what happens when nothing pins ||rep||) would
+    # have that epsilon take over and report a spurious rank. After the rescale, tr S = 1 and
+    # ||X X^T||_F^2 lies in [1 / min(b, d), 1], so the epsilon can never dominate.
+    fro_sq = jnp.sum(jnp.square(centered))
+    scale_sq = jnp.sum(jnp.square(rep))
+    normed = centered / jnp.sqrt(fro_sq + 1e-30)
+    gram = normed @ normed.T
+    eff_rank = 1.0 / (jnp.sum(jnp.square(gram)) + 1e-30)
+    # Total collapse: no across-batch variance relative to the rep's own magnitude. The
+    # participation ratio is 0/0 there, and `normed` would be pure roundoff whose rank is
+    # high — the exact opposite of the truth. Report the floor of 1 instead.
+    eff_rank = jnp.where(fro_sq > 1e-8 * (scale_sq + 1e-30), eff_rank, 1.0)
+
+    unit = _l2_normalize(rep)
+    cos = unit @ unit.T
+    # Strip the b unit-valued diagonal entries before averaging.
+    offdiag_cos = (jnp.sum(cos) - jnp.trace(cos)) / jnp.maximum(b * (b - 1), 1)
+
     return {
         f"{name}_std": jnp.mean(jnp.std(rep, axis=0)),
         f"{name}_mean_norm": jnp.linalg.norm(jnp.mean(rep, axis=0)),
+        f"{name}_eff_rank": eff_rank,
+        f"{name}_eff_rank_frac": eff_rank / min(b, rep.shape[1]),
+        f"{name}_offdiag_cos": offdiag_cos,
     }
 
 
 class _RepHead(nn.Module):
     """Attention-pooling head: reuses gemma Blocks to pool a layer-mixed backbone
-    token sequence into a single vector via a learned query token."""
+    token sequence into a single vector via a learned query token.
+
+    `config.width` may be narrower than the incoming memory width (see
+    Pi0RepBaseConfig.rep_head_width); an input projection then maps the memory down before
+    the blocks. `block_dropout` applies feature dropout between blocks, in addition to the
+    single `dropout` mask on the pooled output.
+    """
 
     config: _gemma.Config
     embed_dtype: str
     dropout: float = 0.0
+    block_dropout: float = 0.0
 
     @nn.compact
     def __call__(self, memory, memory_mask, *, deterministic: bool = True, dropout_rng=None):
         # memory: (b, t, d); memory_mask: (b, t) bool
         memory = memory.astype(self.embed_dtype)
+        if memory.shape[-1] != self.config.width:
+            # Narrowed head: project the backbone-width memory down to the head width. Named
+            # explicitly so the param path is stable across checkpoints.
+            memory = nn.Dense(self.config.width, name="in_proj", dtype=self.embed_dtype)(memory)
         b, t, d = memory.shape
         query = self.param("query", nn.initializers.normal(0.02), (1, 1, d))
         query = jnp.broadcast_to(query, (b, 1, d)).astype(self.embed_dtype)
@@ -82,6 +140,11 @@ class _RepHead(nn.Module):
             (seq,), _ = _gemma.Block(configs=(self.config,), name=f"layers_{i}")(
                 [seq], None, positions, attn_mask, [None]
             )
+            if self.block_dropout > 0.0:
+                # fold_in so each block (and the pooled-output mask below) draws its own mask
+                # from the single key threaded in by the caller.
+                block_rng = None if dropout_rng is None else jax.random.fold_in(dropout_rng, i)
+                seq = _feature_dropout(seq, self.block_dropout, deterministic=deterministic, rng=block_rng)
         seq, _ = _gemma.RMSNorm(name="final_norm")(seq, None)
         pooled = seq[:, -1]  # (b, d) — the pooled query row
         return _feature_dropout(pooled, self.dropout, deterministic=deterministic, rng=dropout_rng)
@@ -129,8 +192,27 @@ class Pi0RepBase(_pi0.Pi0):
         psi_mem_width = widths[config.psi_input]
         phi_mem_width = widths[config.phi_input]
 
-        def _head_config(width):
-            return dataclasses.replace(paligemma_config, width=width, depth=config.rep_head_depth, lora_configs={})
+        def _head_config(mem_width):
+            if config.rep_head_width is None:
+                # Historical behavior: head width follows whatever feeds it, while mlp_dim and
+                # head_dim stay at paligemma's values regardless. Left exactly as-is — note a
+                # "state_action" head already runs at mem_width 1024 with paligemma's 16384
+                # mlp_dim, so rescaling here would silently change existing configs.
+                return dataclasses.replace(
+                    paligemma_config, width=mem_width, depth=config.rep_head_depth, lora_configs={}
+                )
+            # Narrowed head: scale mlp_dim and head_dim by the same factor so the block keeps
+            # gemma's proportions. num_heads is preserved, and _RepHead inserts an in_proj
+            # from mem_width down to the head width.
+            scale = config.rep_head_width / mem_width
+            return dataclasses.replace(
+                paligemma_config,
+                width=config.rep_head_width,
+                depth=config.rep_head_depth,
+                mlp_dim=max(int(paligemma_config.mlp_dim * scale), 1),
+                head_dim=max(int(paligemma_config.head_dim * scale), 1),
+                lora_configs={},
+            )
 
         # The psi trio (psi_head/psi_mix/psi_proj) is optional: subclasses whose loss never
         # reads psi (Pi0SP) set enable_psi_head=False to drop ~1e8 dead params — and their
@@ -139,14 +221,24 @@ class Pi0RepBase(_pi0.Pi0):
         # the default (enabled) path are unchanged.
         if config.enable_psi_head:
             psi_head = nnx_bridge.ToNNX(
-                _RepHead(_head_config(psi_mem_width), config.dtype, dropout=config.rep_head_dropout)
+                _RepHead(
+                    _head_config(psi_mem_width),
+                    config.dtype,
+                    dropout=config.rep_head_dropout,
+                    block_dropout=config.rep_head_block_dropout,
+                )
             )
             psi_head.lazy_init(jnp.zeros((1, 2, psi_mem_width)), jnp.ones((1, 2), dtype=bool), rngs=rngs)
             self.psi_head = psi_head
         else:
             self.psi_head = None
         phi_head = nnx_bridge.ToNNX(
-            _RepHead(_head_config(phi_mem_width), config.dtype, dropout=config.rep_head_dropout)
+            _RepHead(
+                _head_config(phi_mem_width),
+                config.dtype,
+                dropout=config.rep_head_dropout,
+                block_dropout=config.rep_head_block_dropout,
+            )
         )
         phi_head.lazy_init(jnp.zeros((1, 2, phi_mem_width)), jnp.ones((1, 2), dtype=bool), rngs=rngs)
         self.phi_head = phi_head

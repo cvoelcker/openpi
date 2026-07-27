@@ -141,6 +141,45 @@ class Observation(Generic[ArrayT]):
 Actions = at.Float[ArrayT, "*b ah ad"]
 
 
+@dataclasses.dataclass(frozen=True)
+class ImageAugmentConfig:
+    """Magnitudes for the train-time image augmentation in `preprocess_observation`.
+
+    Every default reproduces the values that were previously hardcoded, so constructing this
+    with no arguments is a no-op change. Exposed because the right strength is objective-
+    dependent: for a one-step latent forward model (Pi0SP) the augmentation perturbs the rep
+    far more than a single control step of motion does, which can bury the dynamics signal
+    under nuisance variance. See `Pi0SPConfig.target_augmentation`.
+    """
+
+    # Fraction of height/width kept by the random crop before resizing back. 1.0 disables it.
+    random_crop_fraction: float = 0.95
+    # Rotation range in degrees, applied symmetrically as (-x, x). 0.0 disables it.
+    rotate_degrees: float = 5.0
+    brightness: float = 0.3
+    contrast: float = 0.4
+    saturation: float = 0.5
+    # Wrist cameras historically get color jitter only: a crop or rotation there changes the
+    # implied gripper geometry rather than acting as a nuisance transform.
+    geometric_on_wrist: bool = False
+
+    def build(self, key: str, height: int, width: int) -> list:
+        """augmax transforms for one camera, in the historical order."""
+        transforms = []
+        if self.geometric_on_wrist or "wrist" not in key:
+            if self.random_crop_fraction < 1.0:
+                transforms += [
+                    augmax.RandomCrop(int(width * self.random_crop_fraction), int(height * self.random_crop_fraction)),
+                    augmax.Resize(width, height),
+                ]
+            if self.rotate_degrees > 0.0:
+                transforms += [augmax.Rotate((-self.rotate_degrees, self.rotate_degrees))]
+        transforms += [
+            augmax.ColorJitter(brightness=self.brightness, contrast=self.contrast, saturation=self.saturation)
+        ]
+        return transforms
+
+
 def preprocess_observation(
     rng: at.KeyArrayLike | None,
     observation: Observation,
@@ -148,10 +187,15 @@ def preprocess_observation(
     train: bool = False,
     image_keys: Sequence[str] = IMAGE_KEYS,
     image_resolution: tuple[int, int] = IMAGE_RESOLUTION,
+    augment: ImageAugmentConfig | None = None,
 ) -> Observation:
     """Preprocess the observations by performing image augmentations (if train=True), resizing (if necessary), and
     filling in a default image mask (if necessary).
+
+    `augment` controls the augmentation magnitudes; None uses the historical defaults. Note
+    that `train` gates augmentation ONLY — resizing and the default mask always happen.
     """
+    augment = augment or ImageAugmentConfig()
 
     if not set(image_keys).issubset(observation.images):
         raise ValueError(f"images dict missing keys: expected {image_keys}, got {list(observation.images)}")
@@ -169,17 +213,11 @@ def preprocess_observation(
             # Convert from [-1, 1] to [0, 1] for augmax.
             image = image / 2.0 + 0.5
 
-            transforms = []
-            if "wrist" not in key:
-                height, width = image.shape[1:3]
-                transforms += [
-                    augmax.RandomCrop(int(width * 0.95), int(height * 0.95)),
-                    augmax.Resize(width, height),
-                    augmax.Rotate((-5, 5)),
-                ]
-            transforms += [
-                augmax.ColorJitter(brightness=0.3, contrast=0.4, saturation=0.5),
-            ]
+            height, width = image.shape[1:3]
+            transforms = augment.build(key, height, width)
+            # Note: augmax draws a fresh key per batch element, so the nuisance transform is
+            # PER-SAMPLE. Any two observations preprocessed with the same rng therefore share
+            # a per-sample augmentation fingerprint — see Pi0SPConfig.target_augmentation.
             sub_rngs = jax.random.split(rng, image.shape[0])
             image = jax.vmap(augmax.Chain(*transforms))(sub_rngs, image)
 

@@ -87,8 +87,12 @@ class Pi0CRL(Pi0RepBase):
         # Augment each contrastive view independently — a shared key would apply the
         # identical crop/rotation/jitter to each anchor/future pair, letting the model match
         # on shared appearance artifacts instead of learning temporal state progress.
-        observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
-        future_observation = _model.preprocess_observation(future_preprocess_rng, future_observation, train=train)
+        observation = _model.preprocess_observation(
+            preprocess_rng, observation, train=train, augment=self.image_augment
+        )
+        future_observation = _model.preprocess_observation(
+            future_preprocess_rng, future_observation, train=train, augment=self.image_augment
+        )
 
         # Stack current + future (+ optional within-task negative, + optional next/goal for the
         # val ranking probe) for one forward pass. `slots` records each view's position in the
@@ -103,7 +107,7 @@ class Pi0CRL(Pi0RepBase):
         ):
             if obs is not None:
                 slots[name] = len(obs_group)
-                obs_group.append(_model.preprocess_observation(obs_rng, obs, train=train))
+                obs_group.append(_model.preprocess_observation(obs_rng, obs, train=train, augment=self.image_augment))
         observation_stacked = jax.tree_util.tree_map(lambda *xs: jnp.concatenate(xs, axis=0), *obs_group)
         actions_stacked = jnp.concatenate([actions] * len(obs_group), axis=0)
 

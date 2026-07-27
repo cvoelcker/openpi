@@ -40,6 +40,10 @@ class Pi0Config(_model.BaseModelConfig):
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
 
+    # Train-time image augmentation magnitudes (JAX path only). The default reproduces the
+    # values that used to be hardcoded in `model.preprocess_observation`.
+    image_augment: _model.ImageAugmentConfig = dataclasses.field(default_factory=_model.ImageAugmentConfig)
+
     pytorch_compile_mode: str | None = "max-autotune"
 
     def __post_init__(self):
@@ -126,6 +130,7 @@ class Pi0Config(_model.BaseModelConfig):
 
 
 _REP_INPUTS = ("state", "state_action")
+_TARGET_AUGMENTATIONS = ("independent", "shared", "none")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -150,7 +155,18 @@ class Pi0RepBaseConfig(Pi0Config):
     action_loss_coeff: float = 1.0
     # Number of gemma blocks in each (phi/psi) representation head. Per-config
     # hyperparameter: raise for more head capacity, lower (e.g. 1) for leaner heads.
+    # NOTE: these blocks are freshly initialized, NOT loaded from the backbone checkpoint —
+    # the paligemma config is reused only as a bag of shape hyperparameters. So this is free
+    # to change, but it alters the phi_head/psi_head param tree and therefore breaks resuming
+    # an existing rep checkpoint (warm-starting from a backbone checkpoint is unaffected).
     rep_head_depth: int = 1
+    # Width of the rep-head blocks. None = the width of whatever feeds the head (2048 for a
+    # "state"/prefix input on gemma_2b), which is where essentially all of the head's ~1e8
+    # params live. Set it lower to actually cut head capacity: `rep_dim` does NOT do that —
+    # it only sizes the final phi_proj/psi_proj (backbone_width x rep_dim), a few M params.
+    # A narrower head gets an input projection from the backbone width (see _RepHead).
+    # mlp_dim and head_dim scale with the width; num_heads is preserved.
+    rep_head_width: int | None = None
     # How much of the auxiliary (rep) loss gradient flows into the shared backbone.
     # 0.0 => full stop_gradient (backbone shaped only by the action loss; the rep heads
     # are read-only probes over a learned layer-mix). Values in (0, 1] scale the leak.
@@ -168,6 +184,12 @@ class Pi0RepBaseConfig(Pi0Config):
     # training only. 0.0 = off. A regularizer for the small trainable head set over a
     # frozen backbone; helps close the train<<val rep-loss gap.
     rep_head_dropout: float = 0.0
+    # Dropout applied to the full token sequence BETWEEN the rep head's gemma blocks, during
+    # training only. `rep_head_dropout` above is a single mask on the final pooled (b, d)
+    # vector, which is a weak regularizer for a head this size; this one reaches inside.
+    # Only has an effect when rep_head_depth > 1 (with depth 1 it fires once, after the only
+    # block, just before the pool).
+    rep_head_block_dropout: float = 0.0
     # Whether to build the psi trio (psi_head/psi_mix/psi_proj) at all. Subclasses whose
     # loss never reads psi disable it to drop ~1e8 dead params and, in the
     # frozen-backbone regime, their optimizer state.
@@ -309,6 +331,25 @@ class Pi0SPConfig(Pi0RepBaseConfig):
     sp_loss_coeff: float = 1.0  # Weight on the self-prediction (MSE) loss
     sigreg_loss_coeff: float = 0.01
     normalize_sp_loss: bool = True
+    # How the next observation (the prediction target) is augmented, relative to the current
+    # observation. augmax draws its nuisance transform PER SAMPLE, which is what makes this
+    # choice matter:
+    #   "independent" — fresh augmentation for the target. No shared nuisance, so the batch-
+    #       alignment diagnostics (sp_align_*) stay honest. But the target then carries
+    #       augmentation noise that (phi, a) cannot predict, and since next_observation is
+    #       only ONE control step away, that nuisance can be much larger than the true
+    #       one-step motion — the regression optimum degrades toward the augmentation-
+    #       marginal mean and the action signal weakens (watch sp_loss_ratio_rand -> 1).
+    #   "shared" — same rng as the current observation, so the nuisance cancels in the
+    #       residual and the dynamics signal is cleanest. DANGEROUS for measurement: the
+    #       per-sample augmentation acts as a fingerprint that transfers exactly to the
+    #       target, so sp_align_acc -> 1 / sp_align_rank -> 0 for free and the collapse
+    #       monitor stops meaning anything.
+    #   "none" — clean, deterministic target. No shared nuisance AND no unpredictable target
+    #       noise, while phi is still pushed toward augmentation-invariance because the
+    #       prediction is made from an augmented input. Mirrors what the target branch
+    #       already does for head dropout (it runs deterministic=True).
+    target_augmentation: str = "independent"
     # SIGReg sketch/quadrature: number of random 1D projections (resampled every step), and
     # the Epps-Pulley integration grid over t in [-sigreg_t_max, sigreg_t_max]. The N(0,1)
     # weight makes tails beyond |t|~4 negligible.
@@ -325,14 +366,23 @@ class Pi0SPConfig(Pi0RepBaseConfig):
                 "Pi0SP requires phi_input='state': actions are concatenated to phi explicitly "
                 f"in ForwardProjHead, got phi_input={self.phi_input!r}"
             )
+        if self.target_augmentation not in _TARGET_AUGMENTATIONS:
+            raise ValueError(
+                f"target_augmentation must be one of {_TARGET_AUGMENTATIONS}, got {self.target_augmentation!r}"
+            )
 
     @override
     def get_freeze_filter(self) -> nnx.filterlib.Filter:
-        # Same regime as Pi0RepBaseConfig, but forward_proj must stay trainable too: it takes
-        # the (trainable) phi head's output, so it trains even with a frozen backbone.
-        # sigreg itself has no learnable parameters.
+        # Same regime as Pi0RepBaseConfig, but two more module groups must stay trainable,
+        # since both hang off the (trainable) phi head's output and so train even with a
+        # frozen backbone:
+        #   - forward_proj: the latent forward model.
+        #   - sigreg_proj:  the SIGReg projection head. LeJEPA's issue-#17 fix requires this
+        #     projector to be LEARNED — it is what absorbs the unit-variance / all-directions
+        #     constraint so phi can concentrate variance on forward-model-relevant directions.
+        #     Left frozen it is a fixed random map and the isotropy target is arbitrary.
         if self.backbone_frozen:
-            trainable = nnx_utils.PathRegex(r".*((phi|psi)_(head|mix|proj)|forward_proj).*")
+            trainable = nnx_utils.PathRegex(r".*((phi|psi)_(head|mix|proj)|forward_proj|sigreg_proj).*")
             return nnx.Not(trainable)
         return super().get_freeze_filter()
 

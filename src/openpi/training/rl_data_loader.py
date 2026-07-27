@@ -4,7 +4,9 @@ This module adds HER-style (hindsight) sampling to openpi's standard data pipeli
 For every sampled frame ``t`` (within an episode) it returns four observations:
 
 - ``observation``        : the state at ``t`` (s_t)
-- ``next_observation``   : the state at ``t + 1`` (s_{t+1})
+- ``next_observation``   : the state one FULL ACTION CHUNK later, ``t + action_chunk_size``
+  (10 control steps for the LIBERO configs) — i.e. the frame reached after executing the
+  ``actions`` chunk, NOT ``t + 1``. See ``_sample_indices``.
 - ``future_observation`` : a *random* future state ``s_f`` with ``t < f <= g``
 - ``goal_observation``   : a *random* future "goal" state ``s_g`` with ``t < g < episode_end``
 
@@ -70,6 +72,7 @@ class GoalConditionedBatch(TypedDict, total=False):
     goal_frame_index: at.Array
     negative_frame_index: at.Array
     negative_episode_id: at.Array
+
 
 logger = logging.getLogger(__name__)
 
@@ -442,7 +445,7 @@ def create_goal_conditioned_data_loader(
 
     Each yielded batch is a dict with the following keys (B = batch size):
         - ``observation``        : ``Observation`` at frame t
-        - ``next_observation``   : ``Observation`` at t+1
+        - ``next_observation``   : ``Observation`` at t + action_chunk_size (one full chunk)
         - ``future_observation`` : ``Observation`` at a random f in (t, g]
         - ``goal_observation``   : ``Observation`` at a random goal g in (t, episode_end)
         - ``actions``            : action chunk at t, shape (B, action_horizon, action_dim)
@@ -485,8 +488,7 @@ def create_goal_conditioned_data_loader(
     raw_dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
         delta_timestamps={
-            key: [t / dataset_meta.fps for t in range(action_horizon)]
-            for key in data_config.action_sequence_keys
+            key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
     )
 
@@ -561,12 +563,24 @@ def create_train_val_goal_conditioned_data_loaders(
     if data_config.rlds_data_dir is not None:
         val_pct = int(config.val_fraction * 100)
         train_loader = _create_goal_conditioned_rlds_data_loader(
-            config, data_config, sampling=sampling, sharding=sharding, shuffle=True,
-            num_batches=None, skip_norm_stats=False, tfds_split=f"train[:{100 - val_pct}%]",
+            config,
+            data_config,
+            sampling=sampling,
+            sharding=sharding,
+            shuffle=True,
+            num_batches=None,
+            skip_norm_stats=False,
+            tfds_split=f"train[:{100 - val_pct}%]",
         )
         val_loader = _create_goal_conditioned_rlds_data_loader(
-            config, data_config, sampling=sampling, sharding=sharding, shuffle=False,
-            num_batches=None, skip_norm_stats=False, tfds_split=f"train[{100 - val_pct}%:]",
+            config,
+            data_config,
+            sampling=sampling,
+            sharding=sharding,
+            shuffle=False,
+            num_batches=None,
+            skip_norm_stats=False,
+            tfds_split=f"train[{100 - val_pct}%:]",
         )
         return train_loader, val_loader
 
@@ -579,8 +593,7 @@ def create_train_val_goal_conditioned_data_loaders(
     raw_dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
         delta_timestamps={
-            key: [t / dataset_meta.fps for t in range(action_horizon)]
-            for key in data_config.action_sequence_keys
+            key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
     )
 
@@ -600,13 +613,14 @@ def create_train_val_goal_conditioned_data_loaders(
     def _make_loader(indices):
         # Restrict negatives to the anchor's own split so the val negative marginal stays clean.
         split_task_to_frames = (
-            _build_task_to_frames(frame_task, np.asarray(indices))
-            if data_config.include_negative_observation
-            else None
+            _build_task_to_frames(frame_task, np.asarray(indices)) if data_config.include_negative_observation else None
         )
         dataset = RandomFutureDataset(
-            transformed, ep_start, ep_end,
-            sampling=sampling, action_chunk_size=action_horizon,
+            transformed,
+            ep_start,
+            ep_end,
+            sampling=sampling,
+            action_chunk_size=action_horizon,
             include_next_observation=data_config.include_next_observation,
             include_future_observation=data_config.include_future_observation,
             include_goal_observation=data_config.include_goal_observation,
@@ -625,8 +639,10 @@ def create_train_val_goal_conditioned_data_loaders(
         # diversity than train's N streams, which biases the train/val rep-loss comparison
         # independent of true generalization. Matching worker counts removes that confound.
         torch_loader = _data_loader.TorchDataLoader(
-            dataset, local_batch_size=local_batch_size,
-            sharding=sharding, sampler=sampler,
+            dataset,
+            local_batch_size=local_batch_size,
+            sharding=sharding,
+            sampler=sampler,
             num_workers=config.num_workers,
             seed=config.seed,
         )

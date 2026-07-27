@@ -85,7 +85,25 @@ def _rep_stats(rep: np.ndarray, cosine_max_samples: int, dead_std_threshold: flo
     feat_var = feat_std**2
     # Participation ratio of the feature variances: an effective count of active dims,
     # in [1, D]. ~= D when variance is spread evenly, -> 1 as one direction dominates.
-    eff_rank = float((feat_var.sum() ** 2) / (np.sum(feat_var**2) + 1e-12))
+    # This is the DIAGONAL approximation — it only sees axis-aligned collapse, so a rep that
+    # collapses onto a rotated subspace still scores high. Kept for continuity.
+    eff_rank_diag = float((feat_var.sum() ** 2) / (np.sum(feat_var**2) + 1e-12))
+
+    # Rotation-invariant participation ratio of the full covariance spectrum,
+    # (tr S)^2 / tr(S^2), in [1, min(N, D)]. Same definition as rep_base.batch_rep_stats logs
+    # online, so the two are directly comparable. No eigendecomposition: tr S is the sum of
+    # variances and tr(S^2) = ||S||_F^2. Uses the D x D covariance rather than the N x N Gram
+    # because N (pooled samples) is typically much larger than D here.
+    # Rescaled to unit Frobenius norm so the result is numerically as well as algebraically
+    # scale-free, and guarded against the 0/0 of total collapse — see the matching comment in
+    # rep_base.batch_rep_stats.
+    centered = rep - rep.mean(axis=0, keepdims=True)
+    fro_sq = np.sum(centered**2)
+    if fro_sq > 1e-8 * (np.sum(rep**2) + 1e-30):
+        cov = (centered.T @ centered) / np.sqrt(fro_sq)
+        eff_rank = float((np.trace(cov) ** 2) / (np.sum(cov**2) + 1e-30))
+    else:
+        eff_rank = 1.0
 
     # Mean off-diagonal cosine similarity: ~0 when reps point every which way, -> 1 under
     # directional collapse. Subsampled to bound the N^2 term.
@@ -111,6 +129,8 @@ def _rep_stats(rep: np.ndarray, cosine_max_samples: int, dead_std_threshold: flo
         "feat_std_max": float(feat_std.max()),
         "dead_dim_frac": float(np.mean(feat_std < dead_std_threshold)),
         "eff_rank": eff_rank,
+        "eff_rank_frac": eff_rank / min(n, d),
+        "eff_rank_diag": eff_rank_diag,
         "mean_offdiag_cos": mean_cos,
     }
 
@@ -168,9 +188,7 @@ def main(args: Args) -> None:
         # phi_input="state_action"): read it at the clean action (t~=0), reusing the prefix.
         if phi is None:
             timestep = jnp.full((batch_size,), 0.001)
-            phi = model.get_phi_representation(
-                observation, actions, timestep, kv_cache, prefix_mask, prefix_len
-            )[0]
+            phi = model.get_phi_representation(observation, actions, timestep, kv_cache, prefix_mask, prefix_len)[0]
         out = {"phi": phi.astype(jnp.float32)}
         if psi is not None:
             out["psi"] = psi.astype(jnp.float32)

@@ -192,8 +192,12 @@ class Pi0SF(Pi0RepBase):
         deterministic = not train
         # Augment current/next independently (consistent with pi05crl) so phi(s,a) and the
         # bootstrap phi(s',a') cannot match on shared augmentation artifacts.
-        observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
-        next_observation = _model.preprocess_observation(next_preprocess_rng, next_observation, train=train)
+        observation = _model.preprocess_observation(
+            preprocess_rng, observation, train=train, augment=self.image_augment
+        )
+        next_observation = _model.preprocess_observation(
+            next_preprocess_rng, next_observation, train=train, augment=self.image_augment
+        )
 
         # Task latent z (detached): B(future) for a fraction of the batch, random for the rest.
         # z = B(future): use the already-forwarded future_observation (no train-loop change).

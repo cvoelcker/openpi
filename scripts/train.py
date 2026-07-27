@@ -113,7 +113,11 @@ def _as_batch_dict(batch) -> dict[str, Any]:
 def init_train_state(
     config: _config.TrainConfig, init_rng: at.KeyArrayLike, mesh: jax.sharding.Mesh, *, resume: bool
 ) -> tuple[training_utils.TrainState, Any]:
-    tx = _optimizer.create_optimizer(config.optimizer, config.lr_schedule, weight_decay_mask=None)
+    tx = _optimizer.create_optimizer(
+        config.optimizer,
+        config.lr_schedule,
+        weight_decay_mask=_optimizer.kernel_decay_mask(config.weight_decay_exclude_regex),
+    )
 
     def init(rng: at.KeyArrayLike, partial_params: at.Params | None = None) -> training_utils.TrainState:
         rng, model_rng = jax.random.split(rng)
@@ -343,6 +347,12 @@ def main(config: _config.TrainConfig):
     )
 
     infos = []
+    # Best-val checkpoint tracking (no-op unless config.save_best_val). Not persisted across
+    # a resume: after resuming, `best_val` restarts at inf, so the first val pass will look
+    # like an improvement and write one extra checkpoint.
+    best_val = float("inf")
+    saved_this_step = -1
+    logged_missing_metric = False
     for step in pbar:
         with sharding.set_mesh(mesh):
             train_state, info = ptrain_step(train_rng, train_state, batch)
@@ -371,8 +381,32 @@ def main(config: _config.TrainConfig):
                 val_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_val.items())
                 pbar.write(f"Step {step} [val]: {val_str}")
                 wandb.log(reduced_val, step=step)
+            # Best-val checkpointing: training always runs the full num_train_steps and saves
+            # on a fixed interval, so without this the kept checkpoints have no relationship
+            # to generalization — at ~95 epochs over LIBERO the last one is rarely the best.
+            if config.save_best_val and step > start_step:
+                metric = reduced_val.get(config.best_val_metric)
+                if metric is None:
+                    if step == start_step or not logged_missing_metric:
+                        logging.warning(
+                            "save_best_val is on but %r is not in the val metrics (have: %s); "
+                            "no best checkpoint will be written",
+                            config.best_val_metric,
+                            sorted(reduced_val),
+                        )
+                        logged_missing_metric = True
+                elif float(metric) < best_val:
+                    best_val = float(metric)
+                    if is_main_process:
+                        pbar.write(f"Step {step}: new best {config.best_val_metric}={best_val:.4f}, saving")
+                    _checkpoints.save_state(checkpoint_manager, train_state, train_loader, step)
+                    saved_this_step = step
 
-        if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
+        # `step != saved_this_step` skips a duplicate write when the best-val branch above
+        # already saved this exact step.
+        if ((step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1) and (
+            step != saved_this_step
+        ):
             _checkpoints.save_state(checkpoint_manager, train_state, train_loader, step)
 
     logging.info("Waiting for checkpoint manager to finish")

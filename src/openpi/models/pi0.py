@@ -75,6 +75,8 @@ class Pi0(_model.BaseModel):
     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         self.pi05 = config.pi05
+        # Augmentation magnitudes, forwarded to every train-time preprocess_observation call.
+        self.image_augment = config.image_augment
         paligemma_config = _gemma.get_config(
             config.paligemma_variant,
             lora_rank=config.paligemma_lora_rank,
@@ -400,7 +402,9 @@ class Pi0(_model.BaseModel):
         observation, actions = batch["observation"], batch["actions"]
 
         preprocess_rng, flow_rng = jax.random.split(rng)
-        observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
+        observation = _model.preprocess_observation(
+            preprocess_rng, observation, train=train, augment=self.image_augment
+        )
         x_t, u_t, time = self._sample_flow(flow_rng, actions)
 
         suffix_out, *_ = self._forward(observation, x_t, time)
