@@ -150,7 +150,7 @@ class Pi0RepBaseConfig(Pi0Config):
     action_loss_coeff: float = 1.0
     # Number of gemma blocks in each (phi/psi) representation head. Per-config
     # hyperparameter: raise for more head capacity, lower (e.g. 1) for leaner heads.
-    rep_head_depth: int = 2
+    rep_head_depth: int = 1
     # How much of the auxiliary (rep) loss gradient flows into the shared backbone.
     # 0.0 => full stop_gradient (backbone shaped only by the action loss; the rep heads
     # are read-only probes over a learned layer-mix). Values in (0, 1] scale the leak.
@@ -298,8 +298,8 @@ class Pi0SPConfig(Pi0RepBaseConfig):
     # EMA decay of the lagging psi target (see Pi0RepBaseConfig.psi_lagging_ema). None
     # disables the target network entirely: no psi trio, stop-gradient online targets.
     # enable_psi_head is derived from this in __post_init__ — do not set it directly.
-    forward_proj_blocks: int = 2  # Number of BRO blocks in the forward projection head
-    psi_lagging_ema: float | None = 0.999
+    forward_proj_blocks: int = 1  # Number of BRO blocks in the forward projection head
+    psi_lagging_ema: float | None = 0.995
     # phi must be action-independent ("state"): the actions enter the forward model
     # explicitly, concatenated to phi(s) in ForwardProjHead. A suffix ("state_action") phi
     # would leak the action into both the input rep and the prediction target.
@@ -307,7 +307,8 @@ class Pi0SPConfig(Pi0RepBaseConfig):
     phi_input: str = "state"
     psi_input: str = "state"
     sp_loss_coeff: float = 1.0  # Weight on the self-prediction (MSE) loss
-    sigreg_loss_coeff: float = 0.05
+    sigreg_loss_coeff: float = 0.01
+    normalize_sp_loss: bool = True
     # SIGReg sketch/quadrature: number of random 1D projections (resampled every step), and
     # the Epps-Pulley integration grid over t in [-sigreg_t_max, sigreg_t_max]. The N(0,1)
     # weight makes tails beyond |t|~4 negligible.

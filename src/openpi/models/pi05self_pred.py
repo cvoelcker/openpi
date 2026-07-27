@@ -34,7 +34,7 @@ from typing_extensions import override
 
 from openpi.models import model as _model
 from openpi.models import pi0_config
-from openpi.models.rep_base import Pi0RepBase
+from openpi.models.rep_base import Pi0RepBase, _l2_normalize
 from openpi.models.rep_base import batch_rep_stats
 from openpi.shared import array_typing as at
 
@@ -50,23 +50,15 @@ class BROBlock(nnx.Module):
     """
 
     def __init__(self, latent_dim: int, rngs: nnx.Rngs):
-        self.fc1 = nnx.Linear(latent_dim, latent_dim, rngs=rngs)
+        self.fc1 = nnx.Linear(2 * latent_dim, latent_dim, rngs=rngs)
         self.ln1 = nnx.LayerNorm(latent_dim, rngs=rngs)
-        self.fc2 = nnx.Linear(latent_dim, latent_dim, rngs=rngs)
-        self.ln2 = nnx.LayerNorm(latent_dim, rngs=rngs)
-
-        self.film_beta = nnx.Linear(latent_dim, latent_dim, rngs=rngs)
 
     def __call__(self, x: at.Float[at.Array, "b d"], a: at.Float[at.Array, "b d"]) -> at.Float[at.Array, "b d"]:
-        residual = x
+        x = jnp.concatenate([x,a], axis=-1)
         x = self.fc1(x)
         x = self.ln1(x)
         x = nnx.gelu(x)
-        x = self.fc2(x)
-        x = self.ln2(x)
-        beta = self.film_beta(a)
-        x = x + beta
-        return x + residual
+        return x
 
 
 class ForwardProjHead(nnx.Module):
@@ -80,36 +72,28 @@ class ForwardProjHead(nnx.Module):
     def __init__(self, config: pi0_config.Pi0SPConfig, rngs: nnx.Rngs):
         blocks = config.forward_proj_blocks
         latent_dim = config.rep_dim
-        self.state_fc1 = nnx.Linear(latent_dim, latent_dim, rngs=rngs)
-        self.state_ln1 = nnx.LayerNorm(latent_dim, rngs=rngs)
-        self.state_fc2 = nnx.Linear(latent_dim, latent_dim, rngs=rngs)
         action_in = config.action_dim * config.action_horizon
-        self.action_fc1 = nnx.Linear(action_in, config.rep_dim, rngs=rngs)
-        self.action_ln1 = nnx.LayerNorm(config.rep_dim, rngs=rngs)
-        self.action_fc2 = nnx.Linear(config.rep_dim, config.rep_dim, rngs=rngs)
-        self.action_ln2 = nnx.LayerNorm(config.rep_dim, rngs=rngs)
         self.num_blocks = blocks
+        
+        self.state_fc1 = nnx.Linear(latent_dim, latent_dim, rngs=rngs)
+        self.action_fc1 = nnx.Linear(action_in, config.rep_dim, rngs=rngs)
         self.block_list = nnx.Dict({f"block_{i}": BROBlock(latent_dim, rngs) for i in range(blocks)})
+        self.final = nnx.Linear(latent_dim, latent_dim, rngs=rngs)
 
     def _embed_state(self, x: at.Float[at.Array, "b d"]) -> at.Float[at.Array, "b d"]:
         x = self.state_fc1(x)
-        x = self.state_ln1(x)
-        x = nnx.gelu(x)
-        return self.state_fc2(x)
+        return x
 
     def _embed_action(self, a: at.Float[at.Array, "b ad"]) -> at.Float[at.Array, "b d"]:
         a = self.action_fc1(a)
-        a = self.action_ln1(a)
-        a = nnx.gelu(a)
-        a = self.action_fc2(a)
-        return self.action_ln2(a)
+        return a
 
     def __call__(self, x: at.Float[at.Array, "b d"], a: at.Float[at.Array, "b ad"]) -> at.Float[at.Array, "b d"]:
         x = self._embed_state(x)
         a = self._embed_action(a)
         for i in range(self.num_blocks):
             x = self.block_list[f"block_{i}"](x, a)
-        return x
+        return _l2_normalize(self.final(x))
 
 
 def _sigreg_epps_pulley(
@@ -158,9 +142,8 @@ class Pi0SP(Pi0RepBase):
         super().__init__(config, rngs)
         self.sp_loss_coeff = config.sp_loss_coeff
         self.sigreg_loss_coeff = config.sigreg_loss_coeff
-        # z conditions the action expert via the AdaRMS pathway (keeps the prefix z-free).
-        # Unused by compute_loss (no z is passed); kept for inference-time steering.
         self.z_proj = nnx.Linear(config.rep_dim, self.action_in_proj.out_features, rngs=rngs)
+        self.normalize_loss = config.normalize_sp_loss
 
         self.forward_proj = ForwardProjHead(config, rngs)
 
@@ -246,10 +229,8 @@ class Pi0SP(Pi0RepBase):
             rand_act_rng,
         ) = jax.random.split(rng, 7)
         deterministic = not train
-        # Augment current/next independently (consistent with pi05crl) so phi(s,a) and the
-        # bootstrap phi(s',a') cannot match on shared augmentation artifacts.
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
-        next_observation = _model.preprocess_observation(next_preprocess_rng, next_observation, train=train)
+        next_observation = _model.preprocess_observation(preprocess_rng, next_observation, train=train)
 
         batch_size = actions.shape[0]
 
@@ -272,7 +253,7 @@ class Pi0SP(Pi0RepBase):
         # Reps via Pi0RepBase._compute_rep from the prefix. Layer axis is 0, so slice the
         # batch on axis 1.
         def _rep_slice(which, sl, drop_rng, *, det):
-            return self._compute_rep(
+            return self._finalize_rep(which, self._compute_rep(
                 which,
                 prefix_hidden[:, sl],
                 None,
@@ -280,7 +261,7 @@ class Pi0SP(Pi0RepBase):
                 None,
                 deterministic=det,
                 dropout_rng=drop_rng,
-            )
+            ))
 
         cur = slice(None, batch_size)
         nxt = slice(batch_size, None)
@@ -298,8 +279,24 @@ class Pi0SP(Pi0RepBase):
             not_terminal = jnp.ones((batch_size, 1), dtype=phi_next.dtype)
         else:
             not_terminal = (1.0 - next_is_pad.astype(phi_next.dtype))[:, None]
+        if self.normalize_loss:
+            phi_pred = _l2_normalize(phi_pred)
+            phi_next = _l2_normalize(phi_next)
         sp_resid = not_terminal * (phi_pred - phi_next)
         sp_loss = jnp.mean(jnp.square(sp_resid))
+
+        # ---- Action-usage diagnostic: sp_loss under uniform-noise actions ----
+        # If the forward model ignores `a`, sp_loss with random actions matches sp_loss with
+        # the real ones and the ratio sits near 1 — meaning action-conditioning is nominal
+        # and the predictor is effectively self-predictive. A ratio well above 1 means the
+        # actions carry real information for the target. Fully stop-gradient; diagnostic only.
+        rand_actions = jax.random.uniform(rand_act_rng, actions.shape, minval=-1.0, maxval=1.0)
+        phi_pred_rand = jax.lax.stop_gradient(self.forward_proj(jax.lax.stop_gradient(phi), rand_actions.reshape(batch_size, -1)))
+        if self.normalize_loss:
+            phi_pred_rand = _l2_normalize(phi_pred_rand)
+        sp_resid_rand = not_terminal * (phi_pred_rand - phi_next)
+        sp_loss_rand = jnp.mean(jnp.square(sp_resid_rand))
+        sp_loss_ratio_rand = sp_loss_rand / (sp_loss + 1e-8)
 
         # ---- Collapse monitor: batch alignment of the prediction (diagnostic only) ----
         # Is phi_pred(s,a) meaningfully closer to its own target phi_next than to the other
@@ -329,16 +326,6 @@ class Pi0SP(Pi0RepBase):
         align_margin = jnp.sum(valid * (off_diag_mean - diag_dist)) / n_valid
         align_rank = jnp.sum(valid * align_rank) / n_valid
 
-        # ---- Action-usage diagnostic: sp_loss under uniform-noise actions ----
-        # If the forward model ignores `a`, sp_loss with random actions matches sp_loss with
-        # the real ones and the ratio sits near 1 — meaning action-conditioning is nominal
-        # and the predictor is effectively self-predictive. A ratio well above 1 means the
-        # actions carry real information for the target. Fully stop-gradient; diagnostic only.
-        rand_actions = jax.random.uniform(rand_act_rng, actions.shape, minval=-1.0, maxval=1.0)
-        phi_pred_rand = jax.lax.stop_gradient(self.forward_proj(jax.lax.stop_gradient(phi), rand_actions.reshape(batch_size, -1)))
-        sp_resid_rand = not_terminal * (phi_pred_rand - phi_next)
-        sp_loss_rand = jnp.mean(jnp.square(sp_resid_rand))
-        sp_loss_ratio_rand = sp_loss_rand / (sp_loss + 1e-8)
 
         # phi sigreg loss: LeJEPA's SIGReg on a 2-layer projection of the (grad-carrying)
         # current-half phi (issue #17 fix — the projector absorbs the unit-variance /
@@ -358,6 +345,12 @@ class Pi0SP(Pi0RepBase):
         # sigreg_std -> 1 and sigreg_mean_norm -> 0 as SIGReg pulls the projector output
         # (not phi itself, post issue-#17 fix) toward N(0, I).
         phi_mix_w = jax.nn.softmax(self.phi_mix.value.astype(jnp.float32))
+
+        # Self similarity
+        # Measures gap between phi and next_phi to establish if representations are
+        # mostly episode constant
+        self_sim = jnp.mean(jnp.square(phi - phi_next))
+
         info = {
             "action_loss": jnp.mean(action_loss),
             "sp_loss": sp_loss,
@@ -381,6 +374,7 @@ class Pi0SP(Pi0RepBase):
             "sp_align_rank": align_rank,
             "phi_mix_entropy": -jnp.sum(phi_mix_w * jnp.log(phi_mix_w + 1e-6)),
             "phi_mix_max": jnp.max(phi_mix_w),
+            "phi_self_sim": self_sim,
         }
         total_loss = (
             self.action_loss_coeff * action_loss + self.sp_loss_coeff * sp_loss + self.sigreg_loss_coeff * sigreg_loss
