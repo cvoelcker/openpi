@@ -64,7 +64,16 @@ def batch_rep_stats(rep, name: str) -> dict[str, at.Array]:
     - `{name}_eff_rank_frac`: the same, normalized to [0, 1] so it is comparable across
       rep_dim and batch size.
     - `{name}_offdiag_cos`: mean off-diagonal cosine similarity, -> 1 under directional
-      collapse (which a healthy per-feature std can still hide).
+      collapse (which a healthy per-feature std can still hide). 0 means the samples are
+      mutually orthogonal, which is the healthy end. Read on the RAW rep, so a large shared
+      mean offset drives it toward 1 on its own — deep features usually sit in a narrow cone
+      off the origin, and nothing here pins the mean. Near 1 is therefore only alarming when
+      `_eff_rank` is also near 1; otherwise it is a mean offset (cross-check `_mean_norm`
+      against `_std * sqrt(d)`).
+    - `{name}_offdiag_cos_centered`: the same after removing the batch mean, i.e. with the
+      cone artifact subtracted out. This is the one to read for directional collapse. Its
+      healthy value is ~0 (in fact ~-1/(b-1), since centered vectors sum to zero); -> 1 only
+      if the samples genuinely vary along a single shared direction.
 
     `scripts/eval_rep_stats.py` reports the same quantities offline over a pooled sample.
     """
@@ -91,17 +100,19 @@ def batch_rep_stats(rep, name: str) -> dict[str, at.Array]:
     # high — the exact opposite of the truth. Report the floor of 1 instead.
     eff_rank = jnp.where(fro_sq > 1e-8 * (scale_sq + 1e-30), eff_rank, 1.0)
 
-    unit = _l2_normalize(rep)
-    cos = unit @ unit.T
-    # Strip the b unit-valued diagonal entries before averaging.
-    offdiag_cos = (jnp.sum(cos) - jnp.trace(cos)) / jnp.maximum(b * (b - 1), 1)
+    def _offdiag_cos(x):
+        unit = _l2_normalize(x)
+        cos = unit @ unit.T
+        # Strip the b unit-valued diagonal entries before averaging.
+        return (jnp.sum(cos) - jnp.trace(cos)) / jnp.maximum(b * (b - 1), 1)
 
     return {
         f"{name}_std": jnp.mean(jnp.std(rep, axis=0)),
         f"{name}_mean_norm": jnp.linalg.norm(jnp.mean(rep, axis=0)),
         f"{name}_eff_rank": eff_rank,
         f"{name}_eff_rank_frac": eff_rank / min(b, rep.shape[1]),
-        f"{name}_offdiag_cos": offdiag_cos,
+        f"{name}_offdiag_cos": _offdiag_cos(rep),
+        f"{name}_offdiag_cos_centered": _offdiag_cos(centered),
     }
 
 

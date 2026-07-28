@@ -138,8 +138,8 @@ def test_sigreg_projector_has_no_layernorm():
 
 
 def test_frozen_backbone_keeps_sigreg_proj_trainable():
-    # LeJEPA issue #17: the isotropy constraint is meaningful only if the projector it acts
-    # through is learned. Left frozen it is a fixed random map.
+    # LeJEPA puts a two-layer MLP before SIGReg (issue #14). The isotropy constraint is
+    # meaningful only if that projector is learned — left frozen it is a fixed random map.
     cfg = Pi0SPConfig(
         action_dim=32,
         action_horizon=16,

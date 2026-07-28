@@ -377,10 +377,13 @@ class Pi0SPConfig(Pi0RepBaseConfig):
         # since both hang off the (trainable) phi head's output and so train even with a
         # frozen backbone:
         #   - forward_proj: the latent forward model.
-        #   - sigreg_proj:  the SIGReg projection head. LeJEPA's issue-#17 fix requires this
-        #     projector to be LEARNED — it is what absorbs the unit-variance / all-directions
-        #     constraint so phi can concentrate variance on forward-model-relevant directions.
-        #     Left frozen it is a fixed random map and the isotropy target is arbitrary.
+        #   - sigreg_proj:  the SIGReg projection head, mirroring the two-layer MLP LeJEPA
+        #     puts before SIGReg (LeJEPA issue #14). It absorbs the unit-variance /
+        #     all-directions constraint so phi can concentrate variance on forward-model-
+        #     relevant directions. Left frozen it is a fixed random map and the isotropy
+        #     target is arbitrary, so it must train. Whether constraining the projector
+        #     really constrains phi is an open question upstream (LeJEPA issue #17); the
+        #     `sigreg_loss_phi` diagnostic in pi05self_pred.py measures that gap.
         if self.backbone_frozen:
             trainable = nnx_utils.PathRegex(r".*((phi|psi)_(head|mix|proj)|forward_proj|sigreg_proj).*")
             return nnx.Not(trainable)
