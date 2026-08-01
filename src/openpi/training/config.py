@@ -69,6 +69,15 @@ class AssetsConfig:
 class DataConfig:
     # LeRobot repo id. If None, fake data will be created.
     repo_id: str | None = None
+    # Additional LeRobot repo ids to mix with `repo_id`. All sources share a single set of
+    # normalization stats (resolved from `asset_id`), so they must agree on the state/action
+    # spaces and produce the same transformed keys.
+    extra_repo_ids: Sequence[str] = ()
+    # Sampling weights over [repo_id, *extra_repo_ids]. Empty (the default) samples frames
+    # uniformly across the concatenated sources, i.e. in proportion to dataset size. When
+    # given, weights are normalized and frames are drawn from source i with probability
+    # weights[i], independent of how many frames that source holds.
+    repo_weights: Sequence[float] = ()
     # Directory within the assets directory containing the data assets.
     asset_id: str | None = None
     # Contains precomputed normalization stats. If None, normalization will not be performed.
@@ -193,6 +202,10 @@ class ModelTransformFactory(GroupFactory):
 class DataConfigFactory(abc.ABC):
     # The LeRobot repo id.
     repo_id: str = tyro.MISSING
+    # Additional LeRobot repo ids to mix with `repo_id`. See `DataConfig.extra_repo_ids`.
+    extra_repo_ids: Sequence[str] = ()
+    # Sampling weights over [repo_id, *extra_repo_ids]. See `DataConfig.repo_weights`.
+    repo_weights: Sequence[float] = ()
     # Determines how the assets will be loaded.
     assets: AssetsConfig = dataclasses.field(default_factory=AssetsConfig)
     # Base config that will be updated by the factory.
@@ -205,9 +218,16 @@ class DataConfigFactory(abc.ABC):
     def create_base_config(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         repo_id = self.repo_id if self.repo_id is not tyro.MISSING else None
         asset_id = self.assets.asset_id or repo_id
+        if self.repo_weights and len(self.repo_weights) != 1 + len(self.extra_repo_ids):
+            raise ValueError(
+                f"repo_weights has {len(self.repo_weights)} entries but there are "
+                f"{1 + len(self.extra_repo_ids)} repo ids ({[repo_id, *self.extra_repo_ids]})."
+            )
         return dataclasses.replace(
             self.base_config or DataConfig(),
             repo_id=repo_id,
+            extra_repo_ids=tuple(self.extra_repo_ids),
+            repo_weights=tuple(self.repo_weights),
             asset_id=asset_id,
             norm_stats=self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id),
             use_quantile_norm=model_config.model_type != ModelType.PI0,

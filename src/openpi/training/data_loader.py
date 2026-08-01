@@ -127,10 +127,167 @@ class FakeDataset(Dataset):
         return self._num_samples
 
 
+class MixedLeRobotDataset(Dataset):
+    """Several LeRobot datasets concatenated behind one global frame index.
+
+    Prompts are resolved per source, because ``task_index`` is dataset-local and only that
+    source's metadata can decode it. Episode boundaries, task indices and the per-frame source
+    id are re-based onto the global index so downstream episode splitting and HER sampling can
+    treat the mixture as a single contiguous dataset.
+    """
+
+    def __init__(
+        self,
+        datasets: Sequence[Dataset],
+        raw_datasets: Sequence[lerobot_dataset.LeRobotDataset],
+        weights: Sequence[float] = (),
+    ):
+        self._datasets = list(datasets)
+        self._raw_datasets = list(raw_datasets)
+        lengths = [len(d) for d in self._datasets]
+        self._offsets = np.cumsum([0, *lengths]).astype(np.int64)
+        self._length = int(self._offsets[-1])
+
+        ep_from, ep_to, episode_source = [], [], []
+        for i, raw in enumerate(self._raw_datasets):
+            offset = self._offsets[i]
+            starts = np.asarray(raw.episode_data_index["from"]).astype(np.int64) + offset
+            ends = np.asarray(raw.episode_data_index["to"]).astype(np.int64) + offset
+            ep_from.append(starts)
+            ep_to.append(ends)
+            episode_source.append(np.full(len(starts), i, dtype=np.int64))
+        self.episode_data_index = {"from": np.concatenate(ep_from), "to": np.concatenate(ep_to)}
+        self.episode_dataset_index = np.concatenate(episode_source)
+        self.dataset_index = np.repeat(np.arange(len(lengths), dtype=np.int64), lengths)
+
+        if weights:
+            w = np.asarray(weights, dtype=np.float64)
+            if len(w) != len(self._datasets):
+                raise ValueError(f"Got {len(w)} weights for {len(self._datasets)} datasets.")
+            if np.any(w < 0) or w.sum() <= 0:
+                raise ValueError(f"Dataset weights must be non-negative with a positive sum, got {weights}.")
+            self.mixture_weights: np.ndarray | None = w / w.sum()
+        else:
+            self.mixture_weights = None
+
+        self._frame_task: np.ndarray | None = None
+
+    @property
+    def frame_task(self) -> np.ndarray:
+        """Per-frame task index, offset per source so ids are unique across the mixture."""
+        if self._frame_task is None:
+            parts, offset = [], 0
+            for raw in self._raw_datasets:
+                task = _lerobot_frame_task_index(raw)
+                parts.append(task + offset)
+                offset += int(task.max()) + 1 if len(task) else 0
+            self._frame_task = np.concatenate(parts)
+        return self._frame_task
+
+    def __len__(self) -> int:
+        return self._length
+
+    def __getitem__(self, index: SupportsIndex) -> dict:
+        idx = index.__index__()
+        if idx < 0:
+            idx += self._length
+        i = int(np.searchsorted(self._offsets, idx, side="right") - 1)
+        return self._datasets[i][idx - int(self._offsets[i])]
+
+
+class MixtureSampler(torch.utils.data.Sampler[int]):
+    """Draws frames from per-source groups with replacement: source i with probability weights[i].
+
+    Sampling in two stages (pick a source, then a frame within it) keeps the draw exact without
+    materializing a per-frame probability vector over the whole mixture. Order is always random —
+    a weighted mixture has no meaningful sequential order.
+    """
+
+    def __init__(self, groups: Sequence[np.ndarray], weights: np.ndarray, num_samples: int, seed: int = 0):
+        non_empty = [i for i, g in enumerate(groups) if len(g) > 0]
+        if not non_empty:
+            raise ValueError("MixtureSampler requires at least one non-empty group.")
+        self._groups = [np.asarray(groups[i], dtype=np.int64) for i in non_empty]
+        w = np.asarray(weights, dtype=np.float64)[non_empty]
+        if w.sum() <= 0:
+            raise ValueError("At least one non-empty group must have a positive weight.")
+        self._weights = w / w.sum()
+        self._num_samples = int(num_samples)
+        self._seed = seed
+        self._epoch = 0
+
+    def __len__(self) -> int:
+        return self._num_samples
+
+    def __iter__(self) -> Iterator[int]:
+        rng = np.random.default_rng([self._seed, self._epoch])
+        self._epoch += 1
+        sources = rng.choice(len(self._groups), size=self._num_samples, p=self._weights)
+        counts = np.bincount(sources, minlength=len(self._groups))
+        picks = np.concatenate(
+            [group[rng.integers(0, len(group), size=count)] for group, count in zip(self._groups, counts, strict=True)]
+        )
+        rng.shuffle(picks)
+        return iter(picks.tolist())
+
+
+def base_lerobot_dataset(dataset: Dataset) -> Dataset:
+    """Strip the transform wrappers to reach the underlying LeRobot dataset or mixture."""
+    while isinstance(dataset, TransformedDataset):
+        dataset = dataset._dataset  # noqa: SLF001
+    return dataset
+
+
+def _lerobot_frame_task_index(dataset: lerobot_dataset.LeRobotDataset) -> np.ndarray:
+    hf = dataset.hf_dataset
+    try:
+        # Arrow column access never touches the (lazily-decoded) image columns.
+        return np.asarray(hf.data.column("task_index").to_numpy(zero_copy_only=False)).astype(np.int64)
+    except Exception:  # Fall back to the datasets column accessor.
+        return np.asarray(hf["task_index"]).astype(np.int64)
+
+
+def per_frame_task_index(dataset: Dataset) -> np.ndarray:
+    """Per-frame task index for a LeRobot dataset or a mixture of them."""
+    if isinstance(dataset, MixedLeRobotDataset):
+        return dataset.frame_task
+    return _lerobot_frame_task_index(typing.cast(lerobot_dataset.LeRobotDataset, dataset))
+
+
+def mixture_weights(dataset: Dataset) -> np.ndarray | None:
+    """Sampling weights of a weighted mixture, or None for a plain (size-proportional) dataset."""
+    return getattr(dataset, "mixture_weights", None)
+
+
+def make_frame_sampler(
+    base_dataset: Dataset,
+    indices: np.ndarray,
+    *,
+    shuffle: bool,
+    seed: int,
+    num_samples: int | None = None,
+) -> torch.utils.data.Sampler | list[int]:
+    """Sampler over `indices`. Weighted mixtures draw per source; otherwise a plain shuffle."""
+    indices = np.asarray(indices, dtype=np.int64)
+    weights = mixture_weights(base_dataset)
+    if weights is not None:
+        source = base_dataset.dataset_index[indices]
+        groups = [indices[source == i] for i in range(len(weights))]
+        return MixtureSampler(groups, weights, num_samples or len(indices), seed=seed)
+    if not shuffle:
+        return indices.tolist()
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+    return torch.utils.data.SubsetRandomSampler(indices.tolist(), generator=generator)
+
+
 def _split_episode_indices(
     dataset, val_fraction: float, seed: int
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Split a LeRobot dataset into train/val frame indices by episode.
+    """Split a LeRobot dataset (or mixture) into train/val frame indices by episode.
+
+    Mixtures are split per source, so every source contributes to both splits regardless of
+    the size imbalance between them.
 
     Returns (train_indices, val_indices) as int64 arrays.
     """
@@ -138,10 +295,17 @@ def _split_episode_indices(
     ep_to = np.asarray(dataset.episode_data_index["to"]).astype(np.int64)
     num_episodes = len(ep_from)
 
+    episode_source = getattr(dataset, "episode_dataset_index", None)
+    if episode_source is None:
+        episode_source = np.zeros(num_episodes, dtype=np.int64)
+
     rng = np.random.RandomState(seed)
-    perm = rng.permutation(num_episodes)
-    num_val = max(1, int(num_episodes * val_fraction))
-    val_eps = set(perm[:num_val].tolist())
+    val_eps: set[int] = set()
+    for source in np.unique(episode_source):
+        eps = np.flatnonzero(episode_source == source)
+        perm = rng.permutation(len(eps))
+        num_val = max(1, int(len(eps) * val_fraction))
+        val_eps.update(eps[perm[:num_val]].tolist())
 
     train_indices = np.concatenate(
         [np.arange(ep_from[i], ep_to[i]) for i in range(num_episodes) if i not in val_eps]
@@ -151,10 +315,50 @@ def _split_episode_indices(
     )
 
     logging.info(
-        f"Episode split: {num_episodes - num_val} train / {num_val} val episodes, "
+        f"Episode split: {num_episodes - len(val_eps)} train / {len(val_eps)} val episodes, "
         f"{len(train_indices)} train / {len(val_indices)} val frames"
     )
     return train_indices, val_indices
+
+
+def _create_lerobot_source(
+    repo_id: str, action_horizon: int, data_config: _config.DataConfig
+) -> tuple[Dataset, lerobot_dataset.LeRobotDataset]:
+    """Build one LeRobot dataset plus its prompt-resolved view."""
+    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
+    raw_dataset = lerobot_dataset.LeRobotDataset(
+        repo_id,
+        delta_timestamps={
+            key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
+        },
+    )
+    dataset: Dataset = raw_dataset
+    if data_config.prompt_from_task:
+        dataset = TransformedDataset(raw_dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
+    return dataset, raw_dataset
+
+
+def create_lerobot_dataset(data_config: _config.DataConfig, action_horizon: int) -> Dataset:
+    """Create the LeRobot dataset, mixing sources when `extra_repo_ids` is set."""
+    if data_config.repo_id is None:
+        raise ValueError("Repo ID is not set. Cannot create dataset.")
+    repo_ids = [data_config.repo_id, *data_config.extra_repo_ids]
+    if data_config.repo_weights and len(data_config.repo_weights) != len(repo_ids):
+        raise ValueError(
+            f"repo_weights has {len(data_config.repo_weights)} entries but there are {len(repo_ids)} repo ids."
+        )
+    sources = [_create_lerobot_source(repo_id, action_horizon, data_config) for repo_id in repo_ids]
+    if len(sources) == 1:
+        return sources[0][0]
+    logging.info(
+        f"Mixing {len(sources)} LeRobot datasets {repo_ids} "
+        f"(weights: {list(data_config.repo_weights) or 'proportional to size'})"
+    )
+    return MixedLeRobotDataset(
+        [dataset for dataset, _ in sources],
+        [raw for _, raw in sources],
+        data_config.repo_weights,
+    )
 
 
 def create_torch_dataset(
@@ -165,20 +369,11 @@ def create_torch_dataset(
     if repo_id is None:
         raise ValueError("Repo ID is not set. Cannot create dataset.")
     if repo_id == "fake":
+        if data_config.extra_repo_ids:
+            raise ValueError("extra_repo_ids cannot be combined with the fake dataset.")
         return FakeDataset(model_config, num_samples=1024)
 
-    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
-    dataset = lerobot_dataset.LeRobotDataset(
-        data_config.repo_id,
-        delta_timestamps={
-            key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
-        },
-    )
-
-    if data_config.prompt_from_task:
-        dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
-
-    return dataset
+    return create_lerobot_dataset(data_config, action_horizon)
 
 
 def create_rlds_dataset(
@@ -349,16 +544,14 @@ def create_train_val_data_loaders(
 
     # LeRobot path: split by episode indices.
     dataset = create_torch_dataset(data_config, config.model.action_horizon, config.model)
-    base_dataset = dataset
-    while isinstance(base_dataset, TransformedDataset):
-        base_dataset = base_dataset._dataset
+    base_dataset = base_lerobot_dataset(dataset)
     train_indices, val_indices = _split_episode_indices(base_dataset, config.val_fraction, config.seed)
 
     dataset = transform_dataset(dataset, data_config)
 
     local_batch_size = config.batch_size // jax.process_count()
-    train_sampler = torch.utils.data.SubsetRandomSampler(train_indices.tolist())
-    val_sampler = torch.utils.data.SubsetRandomSampler(val_indices.tolist())
+    train_sampler = make_frame_sampler(base_dataset, train_indices, shuffle=True, seed=config.seed)
+    val_sampler = make_frame_sampler(base_dataset, val_indices, shuffle=True, seed=config.seed)
 
     train_torch_loader = TorchDataLoader(
         dataset,
@@ -414,31 +607,33 @@ def create_torch_data_loader(
         seed: The seed to use for shuffling the data.
     """
     dataset = create_torch_dataset(data_config, action_horizon, model_config)
+    base_dataset = base_lerobot_dataset(dataset)
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
 
-    sampler = None
-    if framework == "pytorch":
-        if torch.distributed.is_initialized():
-            sampler = torch.utils.data.distributed.DistributedSampler(
-                dataset,
-                num_replicas=torch.distributed.get_world_size(),
-                rank=torch.distributed.get_rank(),
-                shuffle=shuffle,
-                drop_last=True,
-            )
-            local_batch_size = batch_size // torch.distributed.get_world_size()
-        else:
-            local_batch_size = batch_size
+    if framework == "pytorch" and not torch.distributed.is_initialized():
+        num_replicas, rank = 1, 0
+        local_batch_size = batch_size
     else:
-        local_batch_size = batch_size // jax.process_count()
-        if jax.process_count() > 1:
-            sampler = torch.utils.data.distributed.DistributedSampler(
-                dataset,
-                num_replicas=jax.process_count(),
-                rank=jax.process_index(),
-                shuffle=shuffle,
-                drop_last=True,
-            )
+        if framework == "pytorch":
+            num_replicas, rank = torch.distributed.get_world_size(), torch.distributed.get_rank()
+        else:
+            num_replicas, rank = jax.process_count(), jax.process_index()
+        local_batch_size = batch_size // num_replicas
+
+    sampler = None
+    if mixture_weights(base_dataset) is not None:
+        # Each replica draws from a disjoint stride of the frames, so the assembled global
+        # batch still respects the mixture weights without duplicating frames across replicas.
+        shard = np.arange(len(base_dataset), dtype=np.int64)[rank::num_replicas]
+        sampler = make_frame_sampler(base_dataset, shard, shuffle=shuffle, seed=seed)
+    elif num_replicas > 1:
+        sampler = torch.utils.data.distributed.DistributedSampler(
+            dataset,
+            num_replicas=num_replicas,
+            rank=rank,
+            shuffle=shuffle,
+            drop_last=True,
+        )
 
     logging.info(f"local_batch_size: {local_batch_size}")
     data_loader = TorchDataLoader(

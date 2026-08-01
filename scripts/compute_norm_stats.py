@@ -32,6 +32,7 @@ def create_torch_dataloader(
     if data_config.repo_id is None:
         raise ValueError("Data config must have a repo_id")
     dataset = _data_loader.create_torch_dataset(data_config, action_horizon, model_config)
+    base_dataset = _data_loader.base_lerobot_dataset(dataset)
     dataset = _data_loader.TransformedDataset(
         dataset,
         [
@@ -47,11 +48,23 @@ def create_torch_dataloader(
     else:
         num_batches = len(dataset) // batch_size
         shuffle = False
+    sampler = None
+    if _data_loader.mixture_weights(base_dataset) is not None:
+        # Stats must reflect the weighted mixture the model actually trains on, not the
+        # size-proportional concatenation.
+        sampler = _data_loader.make_frame_sampler(
+            base_dataset,
+            np.arange(len(base_dataset)),
+            shuffle=True,
+            seed=0,
+            num_samples=num_batches * batch_size,
+        )
     data_loader = _data_loader.TorchDataLoader(
         dataset,
         local_batch_size=batch_size,
         num_workers=num_workers,
-        shuffle=shuffle,
+        shuffle=(sampler is None and shuffle),
+        sampler=sampler,
         num_batches=num_batches,
     )
     return data_loader, num_batches
@@ -108,7 +121,7 @@ def main(config_name: str, max_frames: int | None = None):
 
     norm_stats = {key: stats.get_statistics() for key, stats in stats.items()}
 
-    output_path = config.assets_dirs / data_config.repo_id
+    output_path = config.assets_dirs / (data_config.asset_id or data_config.repo_id)
     print(f"Writing stats to: {output_path}")
     normalize.save(output_path, norm_stats)
 

@@ -36,7 +36,6 @@ import logging
 from typing import TypedDict
 
 import jax
-import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
 import numpy as np
 import torch
 
@@ -94,7 +93,7 @@ class GoalSamplingConfig:
     seed: int = 0
 
 
-def _per_frame_episode_bounds(dataset: lerobot_dataset.LeRobotDataset) -> tuple[np.ndarray, np.ndarray]:
+def _per_frame_episode_bounds(dataset) -> tuple[np.ndarray, np.ndarray]:
     """Build per-frame [episode_start, episode_end) arrays (episode_end is exclusive)."""
     ep_from = np.asarray(dataset.episode_data_index["from"]).astype(np.int64)
     ep_to = np.asarray(dataset.episode_data_index["to"]).astype(np.int64)
@@ -107,14 +106,9 @@ def _per_frame_episode_bounds(dataset: lerobot_dataset.LeRobotDataset) -> tuple[
     return ep_start, ep_end
 
 
-def _per_frame_task_index(dataset: lerobot_dataset.LeRobotDataset) -> np.ndarray:
+def _per_frame_task_index(dataset) -> np.ndarray:
     """Read the per-frame ``task_index`` column (metadata only, no image decode)."""
-    hf = dataset.hf_dataset
-    try:
-        # Arrow column access never touches the (lazily-decoded) image columns.
-        return np.asarray(hf.data.column("task_index").to_numpy(zero_copy_only=False)).astype(np.int64)
-    except Exception:  # noqa: BLE001 -- fall back to the datasets column accessor
-        return np.asarray(hf["task_index"]).astype(np.int64)
+    return _data_loader.per_frame_task_index(dataset)
 
 
 def _build_task_to_frames(frame_task: np.ndarray, frames: np.ndarray | None = None) -> dict[int, np.ndarray]:
@@ -414,7 +408,9 @@ class IterableHERTransformedDataset(_data_loader.IterableDataset):
         return len(self._dataset)
 
 
-def _process_sharded_sampler(indices: np.ndarray, *, shuffle: bool, seed: int) -> torch.utils.data.Sampler | list[int]:
+def _process_sharded_sampler(
+    base_dataset, indices: np.ndarray, *, shuffle: bool, seed: int
+) -> torch.utils.data.Sampler | list[int]:
     """Sampler over `indices` restricted to this process's (rank-strided) shard.
 
     The torch loaders here feed jax.make_array_from_process_local_data, which assembles the
@@ -422,14 +418,10 @@ def _process_sharded_sampler(indices: np.ndarray, *, shuffle: bool, seed: int) -
     slice of the data. Without this, the identically-seeded loaders yield the same local
     batch on every process and the "global" batch is jax.process_count() copies of it.
     A persistent seeded generator draws a fresh permutation every epoch while staying
-    reproducible across runs.
+    reproducible across runs. Weighted mixtures draw per source within the shard instead.
     """
-    local = indices[jax.process_index() :: jax.process_count()].tolist()
-    if not shuffle:
-        return local
-    generator = torch.Generator()
-    generator.manual_seed(seed)
-    return torch.utils.data.SubsetRandomSampler(local, generator=generator)
+    local = np.asarray(indices)[jax.process_index() :: jax.process_count()]
+    return _data_loader.make_frame_sampler(base_dataset, local, shuffle=shuffle, seed=seed)
 
 
 def create_goal_conditioned_data_loader(
@@ -483,27 +475,16 @@ def create_goal_conditioned_data_loader(
 
     action_horizon = config.model.action_horizon
 
-    # Build the raw LeRobot dataset directly so we keep a handle for episode boundaries.
-    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(data_config.repo_id)
-    raw_dataset = lerobot_dataset.LeRobotDataset(
-        data_config.repo_id,
-        delta_timestamps={
-            key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
-        },
-    )
-
-    base_dataset: _data_loader.Dataset = raw_dataset
-    if data_config.prompt_from_task:
-        base_dataset = _data_loader.TransformedDataset(
-            raw_dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)]
-        )
+    # Build the LeRobot dataset (or mixture) directly so we keep a handle for episode boundaries.
+    base_dataset = _data_loader.create_lerobot_dataset(data_config, action_horizon)
+    source_dataset = _data_loader.base_lerobot_dataset(base_dataset)
 
     transformed = _data_loader.transform_dataset(base_dataset, data_config, skip_norm_stats=skip_norm_stats)
 
-    ep_start, ep_end = _per_frame_episode_bounds(raw_dataset)
+    ep_start, ep_end = _per_frame_episode_bounds(source_dataset)
     frame_task, task_to_frames = (None, None)
     if data_config.include_negative_observation:
-        frame_task = _per_frame_task_index(raw_dataset)
+        frame_task = _per_frame_task_index(source_dataset)
         task_to_frames = _build_task_to_frames(frame_task)
     dataset = RandomFutureDataset(
         transformed,
@@ -524,10 +505,11 @@ def create_goal_conditioned_data_loader(
     logger.info(f"local_batch_size: {local_batch_size}")
 
     # Multi-process: each process samples a disjoint shard (single-process keeps the
-    # plain shuffle path so existing single-GPU runs draw the exact same batches).
+    # plain shuffle path so existing single-GPU runs draw the exact same batches). A weighted
+    # mixture always needs the sampler, since the weights are applied there.
     sampler = None
-    if jax.process_count() > 1:
-        sampler = _process_sharded_sampler(np.arange(len(dataset)), shuffle=shuffle, seed=config.seed)
+    if jax.process_count() > 1 or _data_loader.mixture_weights(source_dataset) is not None:
+        sampler = _process_sharded_sampler(source_dataset, np.arange(len(dataset)), shuffle=shuffle, seed=config.seed)
 
     torch_loader = _data_loader.TorchDataLoader(
         dataset,
@@ -589,26 +571,15 @@ def create_train_val_goal_conditioned_data_loaders(
         raise ValueError("Val split requires a real dataset.")
 
     action_horizon = config.model.action_horizon
-    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(data_config.repo_id)
-    raw_dataset = lerobot_dataset.LeRobotDataset(
-        data_config.repo_id,
-        delta_timestamps={
-            key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
-        },
-    )
-
-    base_dataset: _data_loader.Dataset = raw_dataset
-    if data_config.prompt_from_task:
-        base_dataset = _data_loader.TransformedDataset(
-            raw_dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)]
-        )
+    base_dataset = _data_loader.create_lerobot_dataset(data_config, action_horizon)
+    source_dataset = _data_loader.base_lerobot_dataset(base_dataset)
 
     transformed = _data_loader.transform_dataset(base_dataset, data_config)
 
-    ep_start, ep_end = _per_frame_episode_bounds(raw_dataset)
-    train_indices, val_indices = _data_loader._split_episode_indices(raw_dataset, config.val_fraction, config.seed)
+    ep_start, ep_end = _per_frame_episode_bounds(source_dataset)
+    train_indices, val_indices = _data_loader._split_episode_indices(source_dataset, config.val_fraction, config.seed)
 
-    frame_task = _per_frame_task_index(raw_dataset) if data_config.include_negative_observation else None
+    frame_task = _per_frame_task_index(source_dataset) if data_config.include_negative_observation else None
 
     def _make_loader(indices):
         # Restrict negatives to the anchor's own split so the val negative marginal stays clean.
@@ -632,7 +603,7 @@ def create_train_val_goal_conditioned_data_loaders(
         local_batch_size = config.batch_size // jax.process_count()
         # Random order for train AND val (see the num_workers comment below for why val
         # samples randomly too), each process drawing a disjoint shard of the split.
-        sampler = _process_sharded_sampler(np.asarray(indices), shuffle=True, seed=config.seed)
+        sampler = _process_sharded_sampler(source_dataset, np.asarray(indices), shuffle=True, seed=config.seed)
         # Use the same worker count for train and val. With per-worker RNG seeding
         # (`_rng` = default_rng([seed, worker_id])), a val loader pinned to num_workers=0 would
         # draw all its futures/goals/negatives from a single persistent stream — lower sampling
