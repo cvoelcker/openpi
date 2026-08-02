@@ -1634,6 +1634,59 @@ _CONFIGS = [
         num_train_steps=30_000,
     ),
     TrainConfig(
+        # `pi05_sp_libero_recommended` with suboptimal demos mixed into the training data.
+        # Model, optimizer and schedule are byte-identical to that config -- see it for the
+        # hyperparameter rationale -- so any difference is attributable to the data mix.
+        name="pi05_sp_libero_recommended_mixed",
+        model=pi0_config.Pi0SPConfig(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            rep_dim=2014,
+            action_loss_coeff=0.0,
+            rep_backbone_grad_scale=0.0,
+            sigreg_loss_coeff=0.01,
+            rep_head_dropout=0.1,
+            rep_head_block_dropout=0.1,
+            target_augmentation="none",
+            image_augment=_model.ImageAugmentConfig(random_crop_fraction=1.0, rotate_degrees=0.0),
+        ),
+        freeze_filter=pi0_config.Pi0SPConfig(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            action_loss_coeff=0.0,
+            rep_backbone_grad_scale=0.0,
+        ).get_freeze_filter(),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            # Same 40 LIBERO tasks, same panda, same fps and the same state[8]/actions[7]
+            # spaces as the base dataset, so both sources share one set of norm stats
+            # (asset_id defaults to repo_id, i.e. the existing physical-intelligence/libero
+            # assets -- no need to recompute).
+            extra_repo_ids=["samp830/libero_40_suboptimal_v1"],
+            # Pinned 50/50 rather than left size-proportional: the frame counts (273k expert
+            # vs 317k suboptimal) would otherwise put the ratio at ~46/54 and drift if either
+            # dataset is regenerated.
+            repo_weights=[0.5, 0.5],
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0, weight_decay=1e-2),
+        ema_decay=0.999,
+        save_best_val=True,
+        best_val_metric="val/rep_loss",
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_libero/params"),
+        num_train_steps=100_000,
+    ),
+    TrainConfig(
         name="pi05_crl_libero_full_finetune_pretrained",
         model=pi0_config.Pi0CRLConfig(
             pi05=True,
