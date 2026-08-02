@@ -1,7 +1,7 @@
 """See _CONFIGS for the list of available configs."""
 
 import abc
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 import dataclasses
 import difflib
 import logging
@@ -78,6 +78,10 @@ class DataConfig:
     # given, weights are normalized and frames are drawn from source i with probability
     # weights[i], independent of how many frames that source holds.
     repo_weights: Sequence[float] = ()
+    # Per-repo git revision override, keyed by repo id. LeRobot otherwise resolves a dataset at
+    # the tag named after its `codebase_version`, which fails on datasets published without that
+    # tag; pointing such a repo at "main" loads it without needing the tag to exist.
+    repo_revisions: Mapping[str, str] = dataclasses.field(default_factory=dict)
     # Directory within the assets directory containing the data assets.
     asset_id: str | None = None
     # Contains precomputed normalization stats. If None, normalization will not be performed.
@@ -206,6 +210,8 @@ class DataConfigFactory(abc.ABC):
     extra_repo_ids: Sequence[str] = ()
     # Sampling weights over [repo_id, *extra_repo_ids]. See `DataConfig.repo_weights`.
     repo_weights: Sequence[float] = ()
+    # Per-repo git revision override. See `DataConfig.repo_revisions`.
+    repo_revisions: Mapping[str, str] = dataclasses.field(default_factory=dict)
     # Determines how the assets will be loaded.
     assets: AssetsConfig = dataclasses.field(default_factory=AssetsConfig)
     # Base config that will be updated by the factory.
@@ -228,6 +234,7 @@ class DataConfigFactory(abc.ABC):
             repo_id=repo_id,
             extra_repo_ids=tuple(self.extra_repo_ids),
             repo_weights=tuple(self.repo_weights),
+            repo_revisions=dict(self.repo_revisions),
             asset_id=asset_id,
             norm_stats=self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id),
             use_quantile_norm=model_config.model_type != ModelType.PI0,
@@ -1665,6 +1672,10 @@ _CONFIGS = [
             # (asset_id defaults to repo_id, i.e. the existing physical-intelligence/libero
             # assets -- no need to recompute).
             extra_repo_ids=["samp830/libero_40_suboptimal_v1"],
+            # That repo declares codebase_version v2.1 but carries no matching git tag, which
+            # is the revision LeRobot resolves by default. Load it from the branch head
+            # instead. Drop this once the repo is tagged v2.1.
+            repo_revisions={"samp830/libero_40_suboptimal_v1": "main"},
             # Pinned 50/50 rather than left size-proportional: the frame counts (273k expert
             # vs 317k suboptimal) would otherwise put the ratio at ~46/54 and drift if either
             # dataset is regenerated.

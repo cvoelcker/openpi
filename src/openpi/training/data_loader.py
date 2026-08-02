@@ -325,12 +325,14 @@ def _create_lerobot_source(
     repo_id: str, action_horizon: int, data_config: _config.DataConfig
 ) -> tuple[Dataset, lerobot_dataset.LeRobotDataset]:
     """Build one LeRobot dataset plus its prompt-resolved view."""
-    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
+    revision = data_config.repo_revisions.get(repo_id)
+    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id, revision=revision)
     raw_dataset = lerobot_dataset.LeRobotDataset(
         repo_id,
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
+        revision=revision,
     )
     dataset: Dataset = raw_dataset
     if data_config.prompt_from_task:
