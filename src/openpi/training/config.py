@@ -78,9 +78,10 @@ class DataConfig:
     # given, weights are normalized and frames are drawn from source i with probability
     # weights[i], independent of how many frames that source holds.
     repo_weights: Sequence[float] = ()
-    # Per-repo git revision override, keyed by repo id. LeRobot otherwise resolves a dataset at
-    # the tag named after its `codebase_version`, which fails on datasets published without that
-    # tag; pointing such a repo at "main" loads it without needing the tag to exist.
+    # Per-repo codebase-version override, keyed by repo id. LeRobot resolves a dataset at the
+    # tag named after its `codebase_version` and parses that name as a version, so this must be
+    # an existing version tag on the repo (e.g. "v2.0") -- a branch name such as "main" raises
+    # packaging.version.InvalidVersion. Useful to pin a dataset to a specific published version.
     repo_revisions: Mapping[str, str] = dataclasses.field(default_factory=dict)
     # Directory within the assets directory containing the data assets.
     asset_id: str | None = None
@@ -1672,10 +1673,6 @@ _CONFIGS = [
             # (asset_id defaults to repo_id, i.e. the existing physical-intelligence/libero
             # assets -- no need to recompute).
             extra_repo_ids=["samp830/libero_40_suboptimal_v1"],
-            # That repo declares codebase_version v2.1 but carries no matching git tag, which
-            # is the revision LeRobot resolves by default. Load it from the branch head
-            # instead. Drop this once the repo is tagged v2.1.
-            repo_revisions={"samp830/libero_40_suboptimal_v1": "main"},
             # Pinned 50/50 rather than left size-proportional: the frame counts (273k expert
             # vs 317k suboptimal) would otherwise put the ratio at ~46/54 and drift if either
             # dataset is regenerated.

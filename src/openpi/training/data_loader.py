@@ -259,6 +259,15 @@ def mixture_weights(dataset: Dataset) -> np.ndarray | None:
     return getattr(dataset, "mixture_weights", None)
 
 
+def process_shard(framework: str = "jax") -> tuple[int, int]:
+    """(num_replicas, rank) for the current process under the active framework."""
+    if framework == "pytorch":
+        if not torch.distributed.is_initialized():
+            return 1, 0
+        return torch.distributed.get_world_size(), torch.distributed.get_rank()
+    return jax.process_count(), jax.process_index()
+
+
 def make_frame_sampler(
     base_dataset: Dataset,
     indices: np.ndarray,
@@ -551,9 +560,14 @@ def create_train_val_data_loaders(
 
     dataset = transform_dataset(dataset, data_config)
 
-    local_batch_size = config.batch_size // jax.process_count()
-    train_sampler = make_frame_sampler(base_dataset, train_indices, shuffle=True, seed=config.seed)
-    val_sampler = make_frame_sampler(base_dataset, val_indices, shuffle=True, seed=config.seed)
+    num_replicas, rank = process_shard(framework)
+    local_batch_size = config.batch_size // num_replicas
+    # The loaders feed jax.make_array_from_process_local_data, which assembles the global batch
+    # from each process's local one, so every process must draw a disjoint slice. Identically
+    # seeded samplers over the full split would make the global batch num_replicas copies of one
+    # local batch.
+    train_sampler = make_frame_sampler(base_dataset, train_indices[rank::num_replicas], shuffle=True, seed=config.seed)
+    val_sampler = make_frame_sampler(base_dataset, val_indices[rank::num_replicas], shuffle=True, seed=config.seed)
 
     train_torch_loader = TorchDataLoader(
         dataset,
@@ -612,15 +626,8 @@ def create_torch_data_loader(
     base_dataset = base_lerobot_dataset(dataset)
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
 
-    if framework == "pytorch" and not torch.distributed.is_initialized():
-        num_replicas, rank = 1, 0
-        local_batch_size = batch_size
-    else:
-        if framework == "pytorch":
-            num_replicas, rank = torch.distributed.get_world_size(), torch.distributed.get_rank()
-        else:
-            num_replicas, rank = jax.process_count(), jax.process_index()
-        local_batch_size = batch_size // num_replicas
+    num_replicas, rank = process_shard(framework)
+    local_batch_size = batch_size // num_replicas
 
     sampler = None
     if mixture_weights(base_dataset) is not None:
