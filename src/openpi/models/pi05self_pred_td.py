@@ -6,7 +6,8 @@ projector, but its output is a two-bin categorical trained with cross-entropy: H
 the support degenerated to {0, 1}, so the two-hot target for a scalar TD target y in [0, 1]
 is simply [1 - y, y]. The value is read back as the bin-weighted expectation, i.e. the
 softmax probability of bin 1. Keeping the categorical form (rather than a scalar sigmoid)
-makes an extension to N bins mechanical.
+makes an extension to N bins mechanical. With value_normalize_input (the default) the head
+sees the L2-normalized rep, matching how downstream consumers query phi.
 
 Reward placement: the 0/1 label sits on the TERMINAL STATE — the episode's last frame, one
 step per episode. Every other anchor has zero reward and bootstraps gamma * V(s'). Note that
@@ -31,6 +32,7 @@ from typing_extensions import override
 from openpi.models import model as _model
 from openpi.models import pi0_config
 from openpi.models.pi05self_pred import Pi0SP
+from openpi.models.rep_base import _l2_normalize
 from openpi.shared import array_typing as at
 
 logger = logging.getLogger("openpi")
@@ -47,12 +49,18 @@ class Pi0SPTD(Pi0SP):
         self.value_gamma = config.value_gamma
         self.value_stop_grad_phi = config.value_stop_grad_phi
         self.value_terminal_aux = config.value_terminal_aux
+        self.value_normalize_input = config.value_normalize_input
 
         # Two logits over the value bins {0, 1}. Shaped after _sigreg_project.
         self.value_head_fc1 = nnx.Linear(config.rep_dim, config.rep_dim, rngs=rngs)
         self.value_head_fc2 = nnx.Linear(config.rep_dim, 2, rngs=rngs)
 
     def _value_logits(self, x: at.Float[at.Array, "b d"]) -> at.Float[at.Array, "b 2"]:
+        x = x.astype(jnp.float32)
+        if self.value_normalize_input:
+            # Pi0SP keeps phi unnormalized; downstream consumers score the unit rep, so the head
+            # is trained on the same input it will be queried with.
+            x = _l2_normalize(x)
         h = self.value_head_fc1(x.astype(jnp.float32))
         h = nnx.gelu(h)
         return self.value_head_fc2(h).astype(jnp.float32)

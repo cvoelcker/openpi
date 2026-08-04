@@ -1720,6 +1720,7 @@ _CONFIGS = [
             rep_head_dropout=0.1,
             rep_head_block_dropout=0.1,
             target_augmentation="none",
+            value_normalize_input=False,
             image_augment=_model.ImageAugmentConfig(random_crop_fraction=1.0, rotate_degrees=0.0),
         ),
         freeze_filter=pi0_config.Pi0SPTDConfig(
@@ -1738,6 +1739,56 @@ _CONFIGS = [
                 include_episode_success=True,
                 # The expert source has no manifest and is all-success by construction, so this
                 # stays False; flip it if a run must fail loudly on an unlabeled source.
+                require_success_labels=False,
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0, weight_decay=1e-2),
+        ema_decay=0.999,
+        save_best_val=True,
+        best_val_metric="val/rep_loss",
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_libero/params"),
+        num_train_steps=100_000,
+    ),
+    TrainConfig(
+        # `pi05_sp_td_libero_mixed` with the value head reading the L2-normalized rep and a
+        # lighter sigreg term.
+        name="pi05_sp_td_libero_mixed_norm",
+        model=pi0_config.Pi0SPTDConfig(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            rep_dim=256,
+            action_loss_coeff=0.0,
+            rep_backbone_grad_scale=0.0,
+            sigreg_loss_coeff=0.1,
+            rep_head_dropout=0.1,
+            rep_head_block_dropout=0.1,
+            target_augmentation="none",
+            value_normalize_input=True,
+            image_augment=_model.ImageAugmentConfig(random_crop_fraction=1.0, rotate_degrees=0.0),
+        ),
+        freeze_filter=pi0_config.Pi0SPTDConfig(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            action_loss_coeff=0.0,
+            rep_backbone_grad_scale=0.0,
+        ).get_freeze_filter(),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            extra_repo_ids=["samp830/libero_40_suboptimal_v1"],
+            repo_weights=[0.5, 0.5],
+            base_config=DataConfig(
+                prompt_from_task=True,
+                include_episode_success=True,
                 require_success_labels=False,
             ),
             extra_delta_transform=False,

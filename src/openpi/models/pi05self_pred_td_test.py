@@ -144,6 +144,17 @@ def test_terminal_aux_uses_next_is_pad():
     assert float(info_on["value_loss"]) > float(info_off["value_loss"])
 
 
+def test_normalize_input_changes_the_value_head_output():
+    # phi is unnormalized in SP, so gating the L2 step must actually change what the head sees.
+    values = []
+    for normalize in (True, False):
+        _, model, obs, actions = _make(value_normalize_input=normalize)
+        batch = _td_batch(obs, actions, success=True, is_terminal=False)
+        _, info = model.compute_loss(jax.random.key(1), batch, train=False)
+        values.append(float(info["value_mean"]))
+    assert values[0] != pytest.approx(values[1], abs=1e-5)
+
+
 def test_compute_loss_raises_without_success_labels():
     _, model, obs, actions = _make()
     batch = {"observation": obs, "actions": actions, "next_observation": obs}

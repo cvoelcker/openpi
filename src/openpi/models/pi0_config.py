@@ -418,6 +418,11 @@ class Pi0SPTDConfig(Pi0SPConfig):
     # already computed), at the price of training the head on the lagging EMA rep. Off by
     # default -- enable if `value_mean` decays toward 0 because the bootstrap has no anchor.
     value_terminal_aux: bool = False
+    # L2-normalize phi before it enters the value head. Pi0SP leaves phi unnormalized, but
+    # downstream consumers of the rep normalize it, so with this on the head is trained in the
+    # space it will be queried in. Not stored in the checkpoint: a run must keep the same
+    # setting on resume, or the head sees inputs on a scale its first layer was never fit on.
+    value_normalize_input: bool = False
 
     @override
     def get_freeze_filter(self) -> nnx.filterlib.Filter:
