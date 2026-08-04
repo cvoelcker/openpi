@@ -1,10 +1,12 @@
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+import json
 import logging
 import multiprocessing
 import os
 import typing
 from typing import Literal, Protocol, SupportsIndex, TypeVar
 
+import huggingface_hub
 import jax
 import jax.numpy as jnp
 import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
@@ -173,6 +175,11 @@ class MixedLeRobotDataset(Dataset):
         self._frame_task: np.ndarray | None = None
 
     @property
+    def raw_datasets(self) -> list[lerobot_dataset.LeRobotDataset]:
+        """The underlying per-source LeRobot datasets, in the order they were concatenated."""
+        return list(self._raw_datasets)
+
+    @property
     def frame_task(self) -> np.ndarray:
         """Per-frame task index, offset per source so ids are unique across the mixture."""
         if self._frame_task is None:
@@ -252,6 +259,84 @@ def per_frame_task_index(dataset: Dataset) -> np.ndarray:
     if isinstance(dataset, MixedLeRobotDataset):
         return dataset.frame_task
     return _lerobot_frame_task_index(typing.cast(lerobot_dataset.LeRobotDataset, dataset))
+
+
+EPISODE_MANIFEST_FILE = "episode_manifest.jsonl"
+
+
+def load_episode_success(
+    repo_id: str, num_episodes: int, *, revision: str | None = None, require: bool = False
+) -> np.ndarray:
+    """Per-episode success labels for a LeRobot repo, as a bool array of length `num_episodes`.
+
+    The label lives in a root-level ``episode_manifest.jsonl`` (one record per episode with
+    ``episode_index`` and ``success``), outside LeRobot's ``meta/``, so LeRobotDataset never
+    reads it. Repos without the manifest hold expert demonstrations only; they are reported as
+    all-success unless `require` is set, in which case the missing label is an error.
+    """
+    try:
+        path = huggingface_hub.hf_hub_download(
+            repo_id, EPISODE_MANIFEST_FILE, repo_type="dataset", revision=revision
+        )
+    except Exception as e:  # Any download failure means "this repo has no labels".
+        if revision is not None:
+            # The manifest may only exist on the default branch even when the data is pinned.
+            return load_episode_success(repo_id, num_episodes, revision=None, require=require)
+        if require:
+            raise ValueError(
+                f"{repo_id} has no {EPISODE_MANIFEST_FILE}, so per-episode success labels are "
+                f"unavailable, but require_success_labels is set."
+            ) from e
+        logging.warning(
+            f"{repo_id} has no {EPISODE_MANIFEST_FILE}; treating all {num_episodes} episodes as "
+            f"successful. Set DataConfig.require_success_labels to make this an error."
+        )
+        return np.ones(num_episodes, dtype=bool)
+
+    success = np.ones(num_episodes, dtype=bool)
+    seen = np.zeros(num_episodes, dtype=bool)
+    with open(path) as f:
+        for line in f:
+            if not (line := line.strip()):
+                continue
+            record = json.loads(line)
+            index = int(record["episode_index"])
+            if 0 <= index < num_episodes:
+                success[index] = bool(record["success"])
+                seen[index] = True
+    if not seen.all():
+        message = f"{repo_id}: {EPISODE_MANIFEST_FILE} covers {int(seen.sum())} of {num_episodes} episodes."
+        if require:
+            raise ValueError(message)
+        logging.warning(f"{message} The uncovered episodes are treated as successful.")
+    logging.info(f"{repo_id}: {int(success.sum())}/{num_episodes} episodes labeled successful.")
+    return success
+
+
+def per_frame_episode_success(
+    dataset: Dataset, *, revisions: Mapping[str, str] | None = None, require: bool = False
+) -> np.ndarray:
+    """Per-frame copy of each episode's success label, for a LeRobot dataset or a mixture.
+
+    Frame indices are the global (mixture-rebased) ones, matching `episode_data_index`.
+    """
+    revisions = revisions or {}
+    raw_datasets = dataset.raw_datasets if isinstance(dataset, MixedLeRobotDataset) else [dataset]
+
+    per_episode = []
+    for raw in raw_datasets:
+        num_episodes = len(np.asarray(raw.episode_data_index["from"]))
+        per_episode.append(
+            load_episode_success(raw.repo_id, num_episodes, revision=revisions.get(raw.repo_id), require=require)
+        )
+    per_episode = np.concatenate(per_episode)
+
+    ep_from = np.asarray(dataset.episode_data_index["from"]).astype(np.int64)
+    ep_to = np.asarray(dataset.episode_data_index["to"]).astype(np.int64)
+    frame_success = np.ones(len(dataset), dtype=bool)
+    for start, end, value in zip(ep_from, ep_to, per_episode, strict=True):
+        frame_success[start:end] = value
+    return frame_success
 
 
 def mixture_weights(dataset: Dataset) -> np.ndarray | None:

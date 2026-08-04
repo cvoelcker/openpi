@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from openpi.models.pi0 import Pi0
     from openpi.models.pi05crl import Pi0CRL
     from openpi.models.pi05self_pred import Pi0SP
+    from openpi.models.pi05self_pred_td import Pi0SPTD
     from openpi.models.pi05sf import Pi0SF
 
 
@@ -394,3 +395,41 @@ class Pi0SPConfig(Pi0RepBaseConfig):
         from openpi.models.pi05self_pred import Pi0SP
 
         return Pi0SP(self, rngs=nnx.Rngs(rng))
+
+
+@dataclasses.dataclass(frozen=True)
+class Pi0SPTDConfig(Pi0SPConfig):
+    """Config for the Self-Prediction variant with a TD-learned value head.
+
+    Instantiates pi05self_pred_td.Pi0SPTD: everything Pi0SP does, plus a two-bin categorical
+    value head on phi trained by TD learning against a 0/1 terminal reward (1 iff the episode
+    succeeded). Requires the data loader to emit `episode_success` and `is_terminal`
+    (DataConfig.include_episode_success).
+    """
+
+    value_loss_coeff: float = 1.0
+    value_gamma: float = 0.99  # TD discount
+    # When True the value head is a pure probe: TD never shapes phi. The control run.
+    value_stop_grad_phi: bool = False
+    # Extra terminal supervision: also regress the value of the NEXT frame's rep onto the
+    # episode outcome whenever next_is_pad is True (that frame is the episode's last). The
+    # reward is defined on one step per episode, so terminal anchors are ~1/episode_length of
+    # the batch; this fires ~action_horizon times more often and costs nothing (the rep is
+    # already computed), at the price of training the head on the lagging EMA rep. Off by
+    # default -- enable if `value_mean` decays toward 0 because the bootstrap has no anchor.
+    value_terminal_aux: bool = False
+
+    @override
+    def get_freeze_filter(self) -> nnx.filterlib.Filter:
+        # As Pi0SPConfig, plus value_head: it hangs off the phi head's output and so trains
+        # even with a frozen backbone.
+        if self.backbone_frozen:
+            trainable = nnx_utils.PathRegex(r".*((phi|psi)_(head|mix|proj)|forward_proj|sigreg_proj|value_head).*")
+            return nnx.Not(trainable)
+        return super().get_freeze_filter()
+
+    @override
+    def create(self, rng: at.KeyArrayLike) -> "Pi0SPTD":
+        from openpi.models.pi05self_pred_td import Pi0SPTD
+
+        return Pi0SPTD(self, rngs=nnx.Rngs(rng))

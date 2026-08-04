@@ -60,6 +60,7 @@ def _make_dataset(
     action_chunk_size=1,
     include_negative_observation=False,
     random_future_control=False,
+    frame_success=None,
 ) -> _rl.RandomFutureDataset:
     ep_start, ep_end = _bounds_from_episodes(episodes)
     num_frames = len(ep_start)
@@ -78,6 +79,7 @@ def _make_dataset(
         random_future_control=random_future_control,
         frame_task=frame_task,
         task_to_frames=task_to_frames,
+        frame_success=frame_success,
     )
 
 
@@ -293,6 +295,71 @@ def test_anchor_observation_matches_index():
     # The anchor observation/actions must correspond to frame t=2.
     assert np.all(item["observation"]["state"] == 2)
     assert np.all(item["actions"] == 2)
+
+
+def test_success_labels_absent_without_frame_success():
+    item = _make_dataset([(0, 5)])[0]
+    assert "episode_success" not in item
+    assert "is_terminal" not in item
+
+
+def test_success_and_terminal_labels():
+    episodes = [(0, 5), (5, 9)]
+    # First episode succeeded, second failed.
+    frame_success = np.array([True] * 5 + [False] * 4)
+    ds = _make_dataset(episodes, frame_success=frame_success)
+    terminal = [bool(ds[t]["is_terminal"]) for t in range(9)]
+    # Exactly one terminal frame per episode: its last.
+    assert terminal == [False, False, False, False, True, False, False, False, True]
+    assert [bool(ds[t]["episode_success"]) for t in range(9)] == frame_success.tolist()
+
+
+def test_terminal_anchors_have_no_valid_bootstrap():
+    # The value loss must not bootstrap on terminal anchors -- their next index is themselves.
+    episodes = [(0, 5)]
+    ds = _make_dataset(episodes, frame_success=np.ones(5, dtype=bool))
+    item = ds[4]
+    assert bool(item["is_terminal"])
+    assert int(item["next_frame_index"]) == 4
+
+
+class _FakeRawDataset:
+    def __init__(self, repo_id, episodes):
+        self.repo_id = repo_id
+        self.episode_data_index = {
+            "from": np.array([s for s, _ in episodes]),
+            "to": np.array([e for _, e in episodes]),
+        }
+
+    def __len__(self):
+        return int(self.episode_data_index["to"][-1])
+
+
+def test_per_frame_episode_success_expands_episode_labels(monkeypatch):
+    raw = _FakeRawDataset("some/repo", [(0, 3), (3, 7)])
+    monkeypatch.setattr(_data_loader, "load_episode_success", lambda *args, **kwargs: np.array([False, True]))
+    frame_success = _data_loader.per_frame_episode_success(raw)
+    assert frame_success.tolist() == [False] * 3 + [True] * 4
+
+
+def test_load_episode_success_without_manifest_defaults_to_all_success(monkeypatch):
+    def _raise(*args, **kwargs):
+        raise FileNotFoundError("no manifest")
+
+    monkeypatch.setattr(_data_loader.huggingface_hub, "hf_hub_download", _raise)
+    assert _data_loader.load_episode_success("some/repo", 3).tolist() == [True, True, True]
+    with pytest.raises(ValueError, match="require_success_labels"):
+        _data_loader.load_episode_success("some/repo", 3, require=True)
+
+
+def test_load_episode_success_reads_the_manifest(monkeypatch, tmp_path):
+    manifest = tmp_path / "episode_manifest.jsonl"
+    manifest.write_text(
+        '{"episode_index": 0, "success": true}\n\n{"episode_index": 2, "success": false}\n'
+        '{"episode_index": 1, "success": false}\n'
+    )
+    monkeypatch.setattr(_data_loader.huggingface_hub, "hf_hub_download", lambda *a, **k: str(manifest))
+    assert _data_loader.load_episode_success("some/repo", 3).tolist() == [True, False, False]
 
 
 def test_end_to_end_collation_and_observation():

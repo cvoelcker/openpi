@@ -58,6 +58,10 @@ class GoalConditionedBatch(TypedDict, total=False):
     actions: at.Float[at.Array, "*b ah ad"]
     next_actions: at.Float[at.Array, "*b ah ad"]
     next_is_pad: at.Array
+    # Outcome of the anchor's episode (constant within an episode) and whether the anchor is
+    # that episode's last frame — the single step the 0/1 reward is defined on.
+    episode_success: at.Array
+    is_terminal: at.Array
     future_is_pad: at.Array
     goal_is_pad: at.Array
     # Per-sample episode identifier (the anchor frame's episode).
@@ -111,6 +115,13 @@ def _per_frame_task_index(dataset) -> np.ndarray:
     return _data_loader.per_frame_task_index(dataset)
 
 
+def _per_frame_episode_success(dataset, data_config: _config.DataConfig) -> np.ndarray:
+    """Per-frame episode-success label (see ``data_loader.per_frame_episode_success``)."""
+    return _data_loader.per_frame_episode_success(
+        dataset, revisions=data_config.repo_revisions, require=data_config.require_success_labels
+    )
+
+
 def _build_task_to_frames(frame_task: np.ndarray, frames: np.ndarray | None = None) -> dict[int, np.ndarray]:
     """Map each task_index to the frame indices belonging to it. Built once at init. When
     ``frames`` is given, restrict to that subset (used to keep train/val negatives within-split)."""
@@ -141,6 +152,7 @@ class RandomFutureDataset(_data_loader.Dataset):
         random_future_control: bool = False,
         frame_task: np.ndarray | None = None,
         task_to_frames: dict[int, np.ndarray] | None = None,
+        frame_success: np.ndarray | None = None,
     ):
         self._dataset = transformed_dataset
         self._ep_start = ep_start
@@ -156,6 +168,7 @@ class RandomFutureDataset(_data_loader.Dataset):
             raise ValueError("include_negative_observation=True requires frame_task and task_to_frames.")
         self._frame_task = frame_task
         self._task_to_frames = task_to_frames
+        self._frame_success = frame_success
         self._gen: np.random.Generator | None = None
 
     def __len__(self) -> int:
@@ -263,6 +276,12 @@ class RandomFutureDataset(_data_loader.Dataset):
             "episode_id": np.int64(self._ep_start[t]),
             "frame_index": np.int64(t),
         }
+        if self._frame_success is not None:
+            item["episode_success"] = np.bool_(self._frame_success[t])
+            # The episode's last frame: the single step the terminal 0/1 reward is defined on
+            # (and the one anchor whose value must not bootstrap -- _sample_indices returns
+            # next_idx == t there).
+            item["is_terminal"] = np.bool_(t == int(self._ep_end[t]) - 1)
         if self._include_next:
             item["next_observation"] = _obs_only(self._dataset[next_idx])
             item["next_is_pad"] = pads["next_is_pad"]
@@ -318,6 +337,8 @@ class GoalConditionedDataLoader(_data_loader.DataLoader):
                 "goal_frame_index",
                 "negative_frame_index",
                 "negative_episode_id",
+                "episode_success",
+                "is_terminal",
             ):
                 if key in batch:
                     out[key] = batch[key]
@@ -486,6 +507,9 @@ def create_goal_conditioned_data_loader(
     if data_config.include_negative_observation:
         frame_task = _per_frame_task_index(source_dataset)
         task_to_frames = _build_task_to_frames(frame_task)
+    frame_success = (
+        _per_frame_episode_success(source_dataset, data_config) if data_config.include_episode_success else None
+    )
     dataset = RandomFutureDataset(
         transformed,
         ep_start,
@@ -499,6 +523,7 @@ def create_goal_conditioned_data_loader(
         random_future_control=data_config.random_future_control,
         frame_task=frame_task,
         task_to_frames=task_to_frames,
+        frame_success=frame_success,
     )
 
     local_batch_size = config.batch_size // jax.process_count()
@@ -580,6 +605,9 @@ def create_train_val_goal_conditioned_data_loaders(
     train_indices, val_indices = _data_loader._split_episode_indices(source_dataset, config.val_fraction, config.seed)
 
     frame_task = _per_frame_task_index(source_dataset) if data_config.include_negative_observation else None
+    frame_success = (
+        _per_frame_episode_success(source_dataset, data_config) if data_config.include_episode_success else None
+    )
 
     def _make_loader(indices):
         # Restrict negatives to the anchor's own split so the val negative marginal stays clean.
@@ -599,6 +627,7 @@ def create_train_val_goal_conditioned_data_loaders(
             random_future_control=data_config.random_future_control,
             frame_task=frame_task,
             task_to_frames=split_task_to_frames,
+            frame_success=frame_success,
         )
         local_batch_size = config.batch_size // jax.process_count()
         # Random order for train AND val (see the num_workers comment below for why val
@@ -643,6 +672,10 @@ def _create_goal_conditioned_rlds_data_loader(
 
     if data_config.random_future_control:
         raise NotImplementedError("random_future_control is only implemented for the LeRobot path.")
+    if data_config.include_episode_success:
+        # DROID is filtered to successful trajectories by file name (droid_rlds_dataset.py), so
+        # there is no negative class to learn a value function against.
+        raise NotImplementedError("include_episode_success is only implemented for the LeRobot path.")
 
     local_batch_size = config.batch_size // jax.process_count()
     logger.info(f"RLDS local_batch_size: {local_batch_size}")

@@ -210,12 +210,25 @@ class Pi0SP(Pi0RepBase):
         *,
         train: bool = False,
     ) -> tuple[at.Float[at.Array, "*b ah"], dict[str, at.Array]]:
+        total_loss, info, _ = self._sp_terms(rng, batch, train=train)
+        return total_loss, info
+
+    def _sp_terms(
+        self,
+        rng: at.KeyArrayLike,
+        batch: dict[str, Any],
+        *,
+        train: bool = False,
+    ) -> tuple[at.Float[at.Array, "*b ah"], dict[str, at.Array], dict[str, at.Array]]:
         """Latent self-prediction loss (MSE onto the lagging-psi target + sigreg) + flow-matching action loss.
 
         Required batch keys: observation, actions, next_observation. phi is
         action-independent (phi_input="state", enforced by Pi0SPConfig), so no
         next_actions are needed — the action enters the forward model explicitly.
         Optional: next_is_pad (terminal masking of the prediction target).
+
+        Returns (total_loss, info, aux). `aux` exposes the computed reps so subclasses can add
+        heads on top of them without a second backbone pass.
         """
         _model.require_batch_keys(
             batch,
@@ -409,4 +422,5 @@ class Pi0SP(Pi0RepBase):
         total_loss = (
             self.action_loss_coeff * action_loss + self.sp_loss_coeff * sp_loss + self.sigreg_loss_coeff * sigreg_loss
         )
-        return total_loss, {"rep_loss": sp_loss + sigreg_loss, **info}
+        aux = {"phi": phi, "phi_next": phi_next_raw}
+        return total_loss, {"rep_loss": sp_loss + sigreg_loss, **info}, aux
