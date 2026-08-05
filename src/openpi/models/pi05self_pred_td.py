@@ -66,6 +66,7 @@ class Pi0SPTD(Pi0SP):
         # the action size; nothing else in the model is touched.
         action_in = config.action_dim * config.action_horizon if config.value_action_conditioned else 0
         self.value_head_fc1 = nnx.Linear(config.rep_dim + action_in, config.rep_dim, rngs=rngs)
+        self.value_norm = nnx.LayerNorm(config.rep_dim, rngs=rngs)
         self.value_head_fc2 = nnx.Linear(config.rep_dim, 2, rngs=rngs)
 
     def _value_logits(
@@ -83,6 +84,7 @@ class Pi0SPTD(Pi0SP):
             # flow-matching target, so they enter the head as-is.
             x = jnp.concatenate([x, actions.reshape(actions.shape[0], -1).astype(jnp.float32)], axis=-1)
         h = self.value_head_fc1(x.astype(jnp.float32))
+        h = self.value_norm(h)
         h = nnx.gelu(h)
         return self.value_head_fc2(h).astype(jnp.float32)
 

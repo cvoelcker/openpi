@@ -2,7 +2,7 @@ source .venv/bin/activate
 
 args=(
   pi05_sp_libero_full_finetune_frozen
-  --exp-name=self_pred_sigrep_film_large # checkpoint/W&B run name
+  --exp-name=self_pred_sigrep_film_norm # checkpoint/W&B run name
   --overwrite                           # replace existing checkpoint dir
   # --data.no-include-next-observation    # skip unused HER next obs
   # --data.no-include-goal-observation    # skip unused HER goal obs

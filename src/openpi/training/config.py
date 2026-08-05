@@ -1584,6 +1584,47 @@ _CONFIGS = [
         num_train_steps=30_000,
     ),
     TrainConfig(
+        name="pi05_sp_libero_recommended_continue",
+        model=pi0_config.Pi0SPConfig(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            rep_dim=1024,
+            action_loss_coeff=0.0,
+            rep_backbone_grad_scale=0.0,
+            sigreg_loss_coeff=0.01,
+            rep_head_dropout=0.1,
+            rep_head_block_dropout=0.1,
+            target_augmentation="none",
+            image_augment=_model.ImageAugmentConfig(random_crop_fraction=1.0, rotate_degrees=0.0),
+        ),
+        freeze_filter=pi0_config.Pi0SPConfig(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            action_loss_coeff=0.0,
+            rep_backbone_grad_scale=0.0,
+        ).get_freeze_filter(),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0, weight_decay=1e-2),
+        ema_decay=0.999,
+        save_best_val=True,
+        best_val_metric="val/rep_loss",
+        weight_loader=weight_loaders.CheckpointWeightLoader("/scratch/11168/cvoelcker/openpi/checkpoints/pi05_sp_libero_recommended/sp_redone_20260727_162926_87fa77/80000/params/"),
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
         name="pi05_sp_libero_recommended",
         model=pi0_config.Pi0SPConfig(
             pi05=True,
@@ -1598,7 +1639,7 @@ _CONFIGS = [
             # collapse, since there are no negatives — effectively switched off. 1.0 puts the
             # two terms on comparable footing; because both are now invariant, this single
             # value transfers to any rep_dim or batch size. Sweep 0.3 / 1 / 3 if needed.
-            sigreg_loss_coeff=1.0,
+            sigreg_loss_coeff=0.01,
             # Dropout on the pooled vector alone is weak for a head this size; block_dropout
             # reaches between the head's gemma blocks. Note it only bites at depth > 1.
             rep_head_dropout=0.1,
@@ -1648,6 +1689,129 @@ _CONFIGS = [
         best_val_metric="val/rep_loss",
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_libero/params"),
         num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_sp_libero_recommended_small",
+        model=pi0_config.Pi0SPConfig(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            rep_dim=256,
+            action_loss_coeff=0.0,
+            rep_backbone_grad_scale=0.0,
+            # sp_loss is now scale/dim/batch invariant and lands in [0, 4] (it is 2 - 2*cos
+            # under normalize_sp_loss). The old 0.01 was calibrated against a term ~1000x
+            # smaller, which left sigreg — the only thing preventing representational
+            # collapse, since there are no negatives — effectively switched off. 1.0 puts the
+            # two terms on comparable footing; because both are now invariant, this single
+            # value transfers to any rep_dim or batch size. Sweep 0.3 / 1 / 3 if needed.
+            sigreg_loss_coeff=0.01,
+            # Dropout on the pooled vector alone is weak for a head this size; block_dropout
+            # reaches between the head's gemma blocks. Note it only bites at depth > 1.
+            rep_head_dropout=0.1,
+            rep_head_block_dropout=0.1,
+            # Clean, deterministic prediction target: no unpredictable augmentation noise in
+            # the regression target, and no per-sample augmentation fingerprint shared with
+            # the input (which would let sp_align_acc -> 1 for free and destroy the collapse
+            # monitor). phi is still pushed toward augmentation-invariance because the
+            # prediction is made from an augmented input.
+            target_augmentation="none",
+            # Geometric augmentation perturbs image-space position, which is the same degree
+            # of freedom the forward model has to predict. next_observation is one action
+            # chunk (10 LIBERO control steps) ahead, so the true displacement is NOT tiny and
+            # this is a genuine trade-off rather than a clear win — hence it is the one thing
+            # worth a follow-up A/B against the default crop/rotate. Photometric jitter is
+            # kept: it adds input diversity without aliasing motion.
+            image_augment=_model.ImageAugmentConfig(random_crop_fraction=1.0, rotate_degrees=0.0),
+        ),
+        freeze_filter=pi0_config.Pi0SPConfig(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            action_loss_coeff=0.0,
+            rep_backbone_grad_scale=0.0,
+        ).get_freeze_filter(),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        # Real decoupled weight decay. The AdamW default of 1e-10 is an inert placeholder, so
+        # until now nothing was regularizing a ~1e8-param head fit on ~1700 LIBERO demos.
+        # weight_decay_exclude_regex keeps it off biases, norm scales, the phi_mix layer-mix
+        # logits and the attention-pooling query.
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0, weight_decay=1e-2),
+        ema_decay=0.999,
+        # 30k steps at batch 256 is ~28 epochs over LIBERO; the last checkpoint is unlikely
+        # to be the best one, and nothing else in the loop selects on generalization.
+        save_best_val=True,
+        best_val_metric="val/rep_loss",
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_libero/params"),
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        # `pi05_sp_libero_recommended` with suboptimal demos mixed into the training data.
+        # Model, optimizer and schedule are byte-identical to that config -- see it for the
+        # hyperparameter rationale -- so any difference is attributable to the data mix.
+        name="pi05_sp_libero_recommended_mixed_small",
+        model=pi0_config.Pi0SPConfig(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            rep_dim=256,
+            action_loss_coeff=0.0,
+            rep_backbone_grad_scale=0.0,
+            sigreg_loss_coeff=1.0,
+            rep_head_dropout=0.1,
+            rep_head_block_dropout=0.1,
+            target_augmentation="none",
+            image_augment=_model.ImageAugmentConfig(random_crop_fraction=1.0, rotate_degrees=0.0),
+        ),
+        freeze_filter=pi0_config.Pi0SPConfig(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            action_loss_coeff=0.0,
+            rep_backbone_grad_scale=0.0,
+        ).get_freeze_filter(),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            # Same 40 LIBERO tasks, same panda, same fps and the same state[8]/actions[7]
+            # spaces as the base dataset, so both sources share one set of norm stats
+            # (asset_id defaults to repo_id, i.e. the existing physical-intelligence/libero
+            # assets -- no need to recompute).
+            extra_repo_ids=["samp830/libero_40_suboptimal_v1"],
+            # That repo declares codebase_version v2.1 but carries no matching git tag, which
+            # is the revision LeRobot resolves by default. Load it from the branch head
+            # instead. Drop this once the repo is tagged v2.1.
+            repo_revisions={"samp830/libero_40_suboptimal_v1": "main"},
+            # Pinned 50/50 rather than left size-proportional: the frame counts (273k expert
+            # vs 317k suboptimal) would otherwise put the ratio at ~46/54 and drift if either
+            # dataset is regenerated.
+            repo_weights=[0.5, 0.5],
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0, weight_decay=1e-2),
+        ema_decay=0.999,
+        save_best_val=True,
+        best_val_metric="val/rep_loss",
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_libero/params"),
+        num_train_steps=100_000,
     ),
     TrainConfig(
         # `pi05_sp_libero_recommended` with suboptimal demos mixed into the training data.
@@ -1768,12 +1932,62 @@ _CONFIGS = [
             rep_dim=256,
             action_loss_coeff=0.0,
             rep_backbone_grad_scale=0.0,
-            sigreg_loss_coeff=0.1,
+            sigreg_loss_coeff=1.0,
             rep_head_dropout=0.1,
             rep_head_block_dropout=0.1,
             target_augmentation="none",
             value_normalize_input=True,
             image_augment=_model.ImageAugmentConfig(random_crop_fraction=1.0, rotate_degrees=0.0),
+        ),
+        freeze_filter=pi0_config.Pi0SPTDConfig(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            action_loss_coeff=0.0,
+            rep_backbone_grad_scale=0.0,
+        ).get_freeze_filter(),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            extra_repo_ids=["samp830/libero_40_suboptimal_v1"],
+            repo_weights=[0.5, 0.5],
+            base_config=DataConfig(
+                prompt_from_task=True,
+                include_episode_success=True,
+                require_success_labels=False,
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0, weight_decay=1e-2),
+        ema_decay=0.999,
+        save_best_val=True,
+        best_val_metric="val/rep_loss",
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_libero/params"),
+        num_train_steps=100_000,
+    ),
+    TrainConfig(
+        # `pi05_sp_td_libero_mixed` with the value head reading the L2-normalized rep and a
+        # lighter sigreg term.
+        name="pi05_sp_td_libero_mixed_norm_big",
+        model=pi0_config.Pi0SPTDConfig(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            rep_dim=1024,
+            action_loss_coeff=0.0,
+            rep_backbone_grad_scale=0.0,
+            sigreg_loss_coeff=1.0,
+            rep_head_dropout=0.1,
+            rep_head_block_dropout=0.1,
+            target_augmentation="independent",
+            value_normalize_input=True,
+            image_augment=_model.ImageAugmentConfig(random_crop_fraction=0.99, rotate_degrees=0.05),
         ),
         freeze_filter=pi0_config.Pi0SPTDConfig(
             pi05=True,

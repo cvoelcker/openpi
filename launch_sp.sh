@@ -1,8 +1,8 @@
 source .venv/bin/activate
 
 args=(
-  pi05_sp_libero_full_finetune_frozen
-  --exp-name=self_pred_sigrep_film_small # checkpoint/W&B run name
+  pi05_sp_libero_recommended
+  --exp-name=sp_redone # checkpoint/W&B run name
   --overwrite                           # replace existing checkpoint dir
   # --data.no-include-next-observation    # skip unused HER next obs
   # --data.no-include-goal-observation    # skip unused HER goal obs
@@ -12,7 +12,7 @@ args=(
   # --data.shuffle-buffer-size=50000      # 50000 won't OOM on 1 node
   --batch-size=256
   --save-interval=2500                # skip periodic save (will save at last train step)
-  --num-train-steps=100000
+  --num-train-steps=150000
 )
 # Run compute_norm_stats first if norm stats for this config name don't exist yet:
 # python scripts/compute_norm_stats.py --config-name="${args[0]}"
