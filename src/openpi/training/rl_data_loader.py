@@ -20,7 +20,9 @@ All four observations flow through the *exact same* openpi transform pipeline
 (state + all camera images) is processed identically to the policy input. Each frame
 also carries an ``*_is_pad`` flag that is ``True`` when the requested index had to be
 clamped to the episode boundary (e.g. when ``t`` is the last frame and no real future
-exists) -- mask these out in your RL loss.
+exists) -- mask these out in your RL loss. Each auxiliary frame also carries the action chunk
+starting at it (``next_actions`` / ``future_actions`` / ``goal_actions`` / ``negative_actions``),
+normalized identically to the anchor's ``actions``.
 
 Notes / limitations:
 - For LeRobot datasets: each sample fetches 4 frames, so image decode + transforms run
@@ -56,7 +58,11 @@ class GoalConditionedBatch(TypedDict, total=False):
     # candidate future in the CRL contrast.
     negative_observation: _model.Observation
     actions: at.Float[at.Array, "*b ah ad"]
+    # Action chunk starting at each auxiliary frame, normalized identically to ``actions``.
     next_actions: at.Float[at.Array, "*b ah ad"]
+    future_actions: at.Float[at.Array, "*b ah ad"]
+    goal_actions: at.Float[at.Array, "*b ah ad"]
+    negative_actions: at.Float[at.Array, "*b ah ad"]
     next_is_pad: at.Array
     # Outcome of the anchor's episode (constant within an episode) and whether the anchor is
     # that episode's last frame — the single step the 0/1 reward is defined on.
@@ -230,12 +236,15 @@ class RandomFutureDataset(_data_loader.Dataset):
         next_is_pad = (t + C) >= ep_end
 
         if num_chunks <= 0:
+            # No full chunk remains. next_idx still points at the episode's last frame (reached in
+            # fewer than C steps), so a value bootstrap off it stays well-defined; future/goal
+            # collapse to t and are masked by their pad flags.
             pads = {
                 "next_is_pad": np.bool_(True),
                 "future_is_pad": np.bool_(True),
                 "goal_is_pad": np.bool_(True),
             }
-            return t, t, t, pads
+            return next_idx, t, t, pads
 
         goal_offset_chunks = self._sample_goal_offset_chunks(num_chunks, rng)
         goal_idx = t + goal_offset_chunks * C
@@ -282,18 +291,27 @@ class RandomFutureDataset(_data_loader.Dataset):
             # (and the one anchor whose value must not bootstrap -- _sample_indices returns
             # next_idx == t there).
             item["is_terminal"] = np.bool_(t == int(self._ep_end[t]) - 1)
+
+        # Each auxiliary frame carries the action chunk starting at it, drawn from the same
+        # transformed dataset as the anchor and therefore normalized identically.
+        def _emit(prefix: str, idx: int) -> None:
+            sample = self._dataset[idx]
+            item[f"{prefix}_observation"] = _obs_only(sample)
+            if (sample_actions := sample.get("actions")) is not None:
+                item[f"{prefix}_actions"] = sample_actions
+
         if self._include_next:
-            item["next_observation"] = _obs_only(self._dataset[next_idx])
+            _emit("next", next_idx)
             item["next_is_pad"] = pads["next_is_pad"]
             item["next_frame_index"] = np.int64(next_idx)
         if self._include_future:
-            item["future_observation"] = _obs_only(self._dataset[future_idx])
+            _emit("future", future_idx)
             item["future_is_pad"] = pads["future_is_pad"]
             item["future_frame_index"] = np.int64(future_idx)
             # Same as episode_id except in random_future_control mode (cross-episode positive).
             item["future_episode_id"] = np.int64(self._ep_start[future_idx])
         if self._include_goal:
-            item["goal_observation"] = _obs_only(self._dataset[goal_idx])
+            _emit("goal", goal_idx)
             item["goal_is_pad"] = pads["goal_is_pad"]
             item["goal_frame_index"] = np.int64(goal_idx)
         if self._include_negative:
@@ -301,7 +319,7 @@ class RandomFutureDataset(_data_loader.Dataset):
             # deliberately unbiased (may land on the anchor's own trajectory).
             same_task_frames = self._task_to_frames[int(self._frame_task[t])]
             neg_idx = int(same_task_frames[self._rng().integers(0, len(same_task_frames))])
-            item["negative_observation"] = _obs_only(self._dataset[neg_idx])
+            _emit("negative", neg_idx)
             item["negative_frame_index"] = np.int64(neg_idx)
             item["negative_episode_id"] = np.int64(self._ep_start[neg_idx])
         if actions is not None:
@@ -342,10 +360,9 @@ class GoalConditionedDataLoader(_data_loader.DataLoader):
             ):
                 if key in batch:
                     out[key] = batch[key]
-            if "actions" in batch:
-                out["actions"] = batch["actions"]
-            if "next_actions" in batch:
-                out["next_actions"] = batch["next_actions"]
+            for key in ("actions", "next_actions", "future_actions", "goal_actions", "negative_actions"):
+                if key in batch:
+                    out[key] = batch[key]
             yield out
 
 
@@ -354,9 +371,9 @@ class IterableHERTransformedDataset(_data_loader.IterableDataset):
 
     The RLDS HER dataset yields pre-batched dicts with keys ``observation``,
     ``next_observation``, ``future_observation``, ``goal_observation``, ``actions``,
-    ``prompt``, and ``*_is_pad`` flags.  This wrapper splits each batch into individual
-    samples, applies the transform pipeline to each of the four observations
-    independently (only the anchor gets actions), and re-stacks into a batch.
+    ``<prefix>_actions``, ``prompt``, and ``*_is_pad`` flags.  This wrapper splits each batch
+    into individual samples, applies the transform pipeline to each of the four observations
+    independently, and re-stacks into a batch.
     """
 
     def __init__(self, dataset: _data_loader.IterableDataset, transform_fn, aux_transform_fn=None):
@@ -395,34 +412,26 @@ class IterableHERTransformedDataset(_data_loader.IterableDataset):
         def _transform_aux(obs_dict) -> dict:
             return self._aux_transform_fn(_build_obs_input(obs_dict))
 
-        # next_observation is transformed through the anchor pipeline together with its
-        # action chunk, so next_actions is normalized identically to actions (SARSA a'
-        # for successor-feature training). future/goal carry no actions, as before.
-        next_actions = None
-        next_observation = None
-        if "next_observation" in sample:
-            if "next_actions" in sample:
-                next_out = self._transform_fn(
-                    _build_obs_input(sample["next_observation"], actions=sample["next_actions"])
-                )
-                next_actions = next_out.pop("actions", None)
-                next_observation = next_out
-            else:
-                next_observation = _transform_aux(sample["next_observation"])
-
         result = {"observation": anchor_out}
-        if next_observation is not None:
-            result["next_observation"] = next_observation
-        for key in ("future_observation", "goal_observation"):
-            if key in sample:
-                result[key] = _transform_aux(sample[key])
+        # An auxiliary frame that carries its own action chunk goes through the anchor pipeline
+        # so its actions are normalized identically to ``actions``; the rest use the aux pipeline.
+        for prefix in ("next", "future", "goal"):
+            obs_key = f"{prefix}_observation"
+            if obs_key not in sample:
+                continue
+            actions_key = f"{prefix}_actions"
+            if actions_key in sample:
+                out = self._transform_fn(_build_obs_input(sample[obs_key], actions=sample[actions_key]))
+                if (aux_actions := out.pop("actions", None)) is not None:
+                    result[actions_key] = aux_actions
+                result[obs_key] = out
+            else:
+                result[obs_key] = _transform_aux(sample[obs_key])
         for key in ("next_is_pad", "future_is_pad", "goal_is_pad", "episode_id"):
             if key in sample:
                 result[key] = sample[key]
         if actions is not None:
             result["actions"] = actions
-        if next_actions is not None:
-            result["next_actions"] = next_actions
         return result
 
     def __len__(self) -> int:
@@ -462,6 +471,8 @@ def create_goal_conditioned_data_loader(
         - ``future_observation`` : ``Observation`` at a random f in (t, g]
         - ``goal_observation``   : ``Observation`` at a random goal g in (t, episode_end)
         - ``actions``            : action chunk at t, shape (B, action_horizon, action_dim)
+        - ``next_actions`` / ``future_actions`` / ``goal_actions`` / ``negative_actions`` : the
+          action chunk starting at the corresponding frame, same shape and normalization
         - ``next_is_pad`` / ``future_is_pad`` / ``goal_is_pad`` : (B,) bool masks that are
           True when the index was clamped to the episode boundary (mask these in your loss)
 

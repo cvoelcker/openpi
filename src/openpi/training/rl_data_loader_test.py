@@ -168,6 +168,21 @@ def test_chunk_last_chunk_frames_are_padded(chunk_size):
             assert pads["goal_is_pad"]
         else:
             assert not pads["future_is_pad"], f"t={t} should have future available"
+
+
+@pytest.mark.parametrize("chunk_size", [2, 3])
+def test_padded_next_points_at_the_terminal_frame(chunk_size):
+    """A padded next index must still be the episode's last frame (reached in fewer than
+    chunk_size steps), never t itself -- a self-referential bootstrap. The only exception is
+    the terminal anchor, where the two coincide and the TD loss masks the bootstrap anyway."""
+    episodes = [(0, 10), (10, 17)]
+    ds = _make_dataset(episodes, gamma=0.9, action_chunk_size=chunk_size)
+    for start, end in episodes:
+        for t in range(start, end):
+            next_idx, _, _, pads = ds._sample_indices(t)  # noqa: SLF001
+            if pads["next_is_pad"]:
+                assert next_idx == end - 1, f"t={t} padded next should be the terminal frame"
+                assert (next_idx == t) == (t == end - 1)
             assert not pads["goal_is_pad"]
 
 
@@ -249,7 +264,7 @@ def test_sampling_is_seeded_deterministic():
     assert [(n, f, g) for n, f, g, _ in seq_a] == [(n, f, g) for n, f, g, _ in seq_b]
 
 
-def test_item_structure_strips_aux_actions():
+def test_item_structure_hoists_aux_actions():
     ds = _make_dataset([(0, 5)])
     item = ds[0]
     assert set(item) == {
@@ -261,6 +276,9 @@ def test_item_structure_strips_aux_actions():
         "future_is_pad",
         "goal_is_pad",
         "actions",
+        "next_actions",
+        "future_actions",
+        "goal_actions",
         "episode_id",
         "frame_index",
         "next_frame_index",
@@ -268,10 +286,21 @@ def test_item_structure_strips_aux_actions():
         "future_episode_id",
         "goal_frame_index",
     }
-    # Auxiliary frames should not carry the (redundant) action chunk.
+    # Action chunks are hoisted to top level, not nested inside the observation dicts.
     for key in ["observation", "next_observation", "future_observation", "goal_observation"]:
         assert "actions" not in item[key]
-    assert item["actions"].shape == (ACTION_HORIZON, ACTION_DIM)
+    for key in ["actions", "next_actions", "future_actions", "goal_actions"]:
+        assert item[key].shape == (ACTION_HORIZON, ACTION_DIM)
+
+
+def test_aux_actions_match_their_frames():
+    """Each auxiliary action chunk must be the one starting at that frame (the fake dataset
+    encodes the frame index in both the state and the action values)."""
+    ds = _make_dataset([(0, 5), (5, 10)], include_negative_observation=True)
+    for t in [0, 2, 6]:
+        item = ds[t]
+        for name in ("next", "future", "goal", "negative"):
+            assert np.all(item[f"{name}_actions"] == int(item[f"{name}_frame_index"]))
 
 
 def test_frame_indices_match_fetched_frames():

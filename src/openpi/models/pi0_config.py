@@ -404,20 +404,21 @@ class Pi0SPTDConfig(Pi0SPConfig):
     Instantiates pi05self_pred_td.Pi0SPTD: everything Pi0SP does, plus a two-bin categorical
     value head on phi trained by TD learning against a 0/1 terminal reward (1 iff the episode
     succeeded). Requires the data loader to emit `episode_success` and `is_terminal`
-    (DataConfig.include_episode_success).
+    (DataConfig.include_episode_success), plus `next_actions` when value_action_conditioned.
     """
 
     value_loss_coeff: float = 1.0
     value_gamma: float = 0.99  # TD discount
     # When True the value head is a pure probe: TD never shapes phi. The control run.
     value_stop_grad_phi: bool = False
-    # Extra terminal supervision: also regress the value of the NEXT frame's rep onto the
-    # episode outcome whenever next_is_pad is True (that frame is the episode's last). The
-    # reward is defined on one step per episode, so terminal anchors are ~1/episode_length of
-    # the batch; this fires ~action_horizon times more often and costs nothing (the rep is
-    # already computed), at the price of training the head on the lagging EMA rep. Off by
-    # default -- enable if `value_mean` decays toward 0 because the bootstrap has no anchor.
-    value_terminal_aux: bool = False
+    # Learn Q(s, a) by SARSA instead of V(s) by TD: the flattened action chunk becomes a second
+    # input to the value head (widening value_head_fc1 only) and the bootstrap scores s' under
+    # the dataset's own a'. Requires the loader to emit `next_actions`.
+    value_action_conditioned: bool = False
+    # Treat the last chunk of a FAILED episode as a truncation (the run hit the step limit)
+    # rather than a terminal worth 0, and drop those rows from the value loss. Set False only
+    # for a dataset whose failures are genuine absorbing states.
+    value_truncated_failure: bool = True
     # L2-normalize phi before it enters the value head. Pi0SP leaves phi unnormalized, but
     # downstream consumers of the rep normalize it, so with this on the head is trained in the
     # space it will be queried in. Not stored in the checkpoint: a run must keep the same

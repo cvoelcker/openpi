@@ -306,9 +306,11 @@ class DroidRldsDataset:
                     if include_future_observation:
                         traj["future_observation"] = gather_obs(traj["observation"], future_indices)
                         traj["future_is_pad"] = tf.logical_not(has_future)
+                        traj["future_actions"] = tf.gather(traj["actions"], future_indices)
                     if include_goal_observation:
                         traj["goal_observation"] = gather_obs(traj["observation"], goal_indices)
                         traj["goal_is_pad"] = tf.logical_not(has_future)
+                        traj["goal_actions"] = tf.gather(traj["actions"], goal_indices)
                     return traj
 
                 dataset = dataset.traj_map(add_her_samples, num_parallel_calls)
