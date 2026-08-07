@@ -258,8 +258,12 @@ class Pi0RepBase(_pi0.Pi0):
         self.psi_mix = nnx.Param(jnp.linspace(1.0, -1.0, num_backbone_layers)) if config.enable_psi_head else None
         self.phi_mix = nnx.Param(jnp.linspace(1.0, -1.0, num_backbone_layers))
 
-        self.phi_proj = nnx.Linear(phi_mem_width, config.rep_dim, rngs=rngs)
-        self.psi_proj = nnx.Linear(psi_mem_width, config.rep_dim, rngs=rngs) if config.enable_psi_head else None
+        # The proj reads the head's pooled output, whose width is the head width (equal to
+        # the memory width only when rep_head_width is None).
+        phi_out_width = _head_config(phi_mem_width).width
+        psi_out_width = _head_config(psi_mem_width).width
+        self.phi_proj = nnx.Linear(phi_out_width, config.rep_dim, rngs=rngs)
+        self.psi_proj = nnx.Linear(psi_out_width, config.rep_dim, rngs=rngs) if config.enable_psi_head else None
 
         # Lagging-psi target network (BYOL/JEPA-style): when set, psi is never trained by
         # gradient descent — TrainConfig.trainable_filter excludes the psi trio — and is

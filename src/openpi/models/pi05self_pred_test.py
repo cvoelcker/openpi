@@ -273,6 +273,13 @@ def test_rep_head_width_shrinks_the_head():
     assert narrow < wide / 4, (narrow, wide)
 
 
+def test_narrowed_head_runs_forward():
+    # The proj after the head must read the head width, not the backbone memory width.
+    _, model, obs, actions = _make(rep_head_width=256, rep_dim=128)
+    _, info = model.compute_loss(jax.random.key(1), _sp_batch(obs, actions), train=False)
+    assert bool(jnp.isfinite(info["sp_loss"]))
+
+
 def test_block_dropout_changes_the_rep_only_in_train_mode():
     _, model, obs, actions = _make(rep_head_block_dropout=0.5, rep_head_depth=2)
     batch = _sp_batch(obs, actions)
