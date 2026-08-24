@@ -110,9 +110,39 @@ def _as_batch_dict(batch) -> dict[str, Any]:
 
 
 @at.typecheck
+def _check_freeze_filter_matches_model(config: _config.TrainConfig) -> None:
+    """Fail loudly when config.freeze_filter disagrees with what config.model implies.
+
+    Configs must build freeze_filter from a duplicate model-config literal, since the `model`
+    field is not referenceable from inside the same constructor call. A `--model.*` override that
+    affects freezing then desyncs the two, and freeze_filter is tyro.conf.Suppress so it cannot be
+    overridden to match. The failure is silent: the optimizer just never updates those params.
+    """
+    implied = getattr(config.model, "get_freeze_filter", None)
+    if implied is None:
+        return
+    abstract = nnx.eval_shape(lambda: config.model.create(jax.random.key(0)))
+    frozen_configured = set(nnx.state(abstract, config.freeze_filter).flat_state())
+    frozen_implied = set(nnx.state(abstract, implied()).flat_state())
+    if frozen_configured != frozen_implied:
+        only_cfg, only_impl = len(frozen_configured - frozen_implied), len(frozen_implied - frozen_configured)
+        raise ValueError(
+            f"freeze_filter disagrees with what config.model implies: {len(frozen_configured)} params frozen "
+            f"by the configured filter vs {len(frozen_implied)} implied by the model "
+            f"({only_cfg} only-configured, {only_impl} only-implied).\n"
+            "This happens when a --model.* override changes freezing (action_loss_coeff, "
+            "rep_backbone_grad_scale, lora variants) but freeze_filter -- which is "
+            "tyro.conf.Suppress and cannot be overridden -- still reflects the config's hardcoded "
+            "duplicate. The run would silently train the wrong parameter set.\n"
+            "Fix: add a named config in config.py whose freeze_filter literal matches the model."
+        )
+
+
+@at.typecheck
 def init_train_state(
     config: _config.TrainConfig, init_rng: at.KeyArrayLike, mesh: jax.sharding.Mesh, *, resume: bool
 ) -> tuple[training_utils.TrainState, Any]:
+    _check_freeze_filter_matches_model(config)
     tx = _optimizer.create_optimizer(
         config.optimizer,
         config.lr_schedule,

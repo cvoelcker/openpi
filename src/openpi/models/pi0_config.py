@@ -1,5 +1,5 @@
 import dataclasses
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import flax.nnx as nnx
 import jax
@@ -7,6 +7,7 @@ import jax.numpy as jnp
 from typing_extensions import override
 
 from openpi.models import model as _model
+from openpi.models import rep_grad_guidance
 import openpi.models.gemma as _gemma
 from openpi.shared import array_typing as at
 import openpi.shared.nnx_utils as nnx_utils
@@ -14,6 +15,7 @@ import openpi.shared.nnx_utils as nnx_utils
 if TYPE_CHECKING:
     from openpi.models.pi0 import Pi0
     from openpi.models.pi05crl import Pi0CRL
+    from openpi.models.pi05fb import Pi0FB
     from openpi.models.pi05self_pred import Pi0SP
     from openpi.models.pi05self_pred_td import Pi0SPTD
     from openpi.models.pi05sf import Pi0SF
@@ -439,3 +441,99 @@ class Pi0SPTDConfig(Pi0SPConfig):
         from openpi.models.pi05self_pred_td import Pi0SPTD
 
         return Pi0SPTD(self, rngs=nnx.Rngs(rng))
+
+
+@dataclasses.dataclass(frozen=True)
+class Pi0FBConfig(Pi0Config):
+    """Forward-Backward representation heads on a frozen pi0.5 backbone.
+
+    Subclasses Pi0Config rather than Pi0RepBaseConfig, whose model builds `phi_*`/`psi_*` trios
+    unconditionally; this model's heads are named `F`/`B`. See pi05fb.py for the objective.
+    """
+
+    # Required, not stylistic: pi05=False gives max_token_len 48, a state token in the suffix and
+    # no AdaRMS, so F would pool a differently shaped suffix. Validated in __post_init__.
+    pi05: bool = True
+    # Explicitly False, not inherited: Pi0Config defaults this to `self.pi05`, which tokenizes the
+    # state into the prompt and so moves the frozen backbone off its fine-tuning distribution.
+    # Use include_proprio to feed the state to the heads instead.
+    discrete_state_input: bool = False
+
+    # --- representation geometry -------------------------------------------------------
+    rep_dim: int = 32
+    # "meanpool" + depth 0 beats the attention head: phi_psi_cossim_centered 0.458 / phi_std 0.319
+    # against depth 2's 0.076 / 0.045.
+    rep_head_kind: str = "meanpool"
+    rep_head_depth: int = 0
+    rep_head_dropout: float = 0.0
+    # 0.0 stop_gradients the backbone's hidden states, making the heads read-only probes. The
+    # layer-mix logits still train.
+    rep_backbone_grad_scale: float = 0.0
+    # F reads the suffix (action-dependent); B reads the prefix (action-independent, as a backward
+    # map must be).
+    F_input: Literal["state", "state_action"] = "state_action"
+    B_input: Literal["state", "state_action"] = "state"
+
+    # --- the FB objective ---------------------------------------------------------------
+    fb_gamma: float = 0.98
+    fb_ortho_coeff: float = 1.0
+    # EMA target networks for the F/B bootstrap; the bilinear TD residual is markedly less stable
+    # than the vector one.
+    fb_target_ema: float | None = 0.99
+    # Exclude the j=i sample from the quadratic term. False matches the reference implementation
+    # (the bias is O(1/b)); `fb_quad_offdiag` is logged either way. Unrelated to the orthonormality
+    # estimator, which is always off-diagonal.
+    fb_quadratic_offdiag_only: bool = False
+
+    # --- optional extra head inputs ------------------------------------------------------
+    # Concatenate the normalized proprioceptive state onto both heads' pooled vectors. Without it
+    # the state never enters the network at all under pi05=True + discrete_state_input=False.
+    include_proprio: bool = False
+    # Training-only escape hatch if F cannot see enough state through the suffix's action tokens:
+    # grad_a_q raises, since guided sampling reaches F via _suffix_forward, which returns no prefix.
+    F_include_prefix: bool = False
+
+    # --- deployment ----------------------------------------------------------------------
+    guidance_schedule: rep_grad_guidance.GuidanceWeightSchedule = dataclasses.field(
+        default_factory=rep_grad_guidance.GuidanceWeightSchedule
+    )
+    # Ablation only: F is trained on clean actions, so the noisy iterate is out of its support.
+    guidance_eval_at_xt: bool = False
+    guidance_grad_clip_norm: float | None = 10.0
+    normalize_z_r: bool = True
+
+    def __post_init__(self):
+        # Must come first: Pi0Config.__post_init__ fills in max_token_len, and shadowing it
+        # without super() leaves the field at its None sentinel.
+        super().__post_init__()
+        if not self.pi05:
+            raise ValueError("Pi0FB requires pi05=True (suffix = action tokens only, AdaRMS present)")
+        if self.B_input != "state":
+            raise ValueError(f"B must be action-independent to be a backward map; got B_input={self.B_input!r}")
+        if self.rep_head_kind not in ("attn", "meanpool"):
+            raise ValueError(f"unknown rep_head_kind={self.rep_head_kind!r}")
+
+    @property
+    @override
+    def requires_goal_data(self) -> bool:
+        """Routes training through rl_data_loader for next_observation / next_actions /
+        next_is_pad. `future_observation` is also produced but unused: F takes no z."""
+        return True
+
+    @property
+    def backbone_frozen(self) -> bool:
+        return self.rep_backbone_grad_scale == 0.0
+
+    @override
+    def get_freeze_filter(self) -> nnx.filterlib.Filter:
+        """Train only the F/B trios. The exact trainable set is pinned by a unit test rather than
+        trusted to this regex."""
+        if self.backbone_frozen:
+            return nnx.Not(nnx_utils.PathRegex(r".*(F|B)_(head|mix|proj).*"))
+        return super().get_freeze_filter()
+
+    @override
+    def create(self, rng: at.KeyArrayLike) -> "Pi0FB":
+        from openpi.models.pi05fb import Pi0FB
+
+        return Pi0FB(self, rngs=nnx.Rngs(rng))

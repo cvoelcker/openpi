@@ -64,6 +64,21 @@ class Policy(BasePolicy):
             self._sample_actions = nnx_utils.module_jit(model.sample_actions)
             self._rng = rng or jax.random.key(0)
 
+    def set_sample_kwarg(self, key: str, value) -> None:
+        """Set one keyword forwarded to the model's sample_actions* call, so callers can adjust
+        sampling on an already-constructed policy without reaching into `_sample_kwargs`."""
+        self._sample_kwargs = {**self._sample_kwargs, key: value}
+
+    def reset_rng(self, seed: int) -> None:
+        """Re-seed the sampling RNG, so a closed-loop rollout's action noise does not depend on
+        how long every preceding episode happened to run.
+
+        Without it, four byte-identical eval runs scored 0.510/0.460/0.470/0.490 and disagreed on
+        14.5% of episodes -- more than the treatment being measured. No-op for PyTorch policies.
+        """
+        if not self._is_pytorch_model:
+            self._rng = jax.random.key(seed)
+
     @override
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
         # Make a copy since transformations may modify the inputs in place.
@@ -104,6 +119,52 @@ class Policy(BasePolicy):
             "infer_ms": model_time * 1000,
         }
         return outputs
+
+    def infer_batch(self, obs_list: Sequence[dict], *, noise: np.ndarray | None = None) -> list[dict]:
+        """Batched counterpart to `infer`: the same per-example transform pipeline, but one
+        `sample_actions` call with a real leading batch dim instead of `len(obs_list)` calls.
+
+        `noise`, if given, must already carry that leading batch dim -- unlike `infer()`'s, which
+        accepts an unbatched array and adds it.
+        """
+        n = len(obs_list)
+        if n == 0:
+            return []
+
+        per_example_inputs = [self._input_transform(jax.tree.map(lambda x: x, obs)) for obs in obs_list]
+        batched_inputs = jax.tree.map(lambda *xs: np.stack(xs, axis=0), *per_example_inputs)
+
+        if not self._is_pytorch_model:
+            batched_inputs = jax.tree.map(jnp.asarray, batched_inputs)
+            self._rng, sample_rng_or_pytorch_device = jax.random.split(self._rng)
+        else:
+            batched_inputs = jax.tree.map(
+                lambda x: torch.from_numpy(np.array(x)).to(self._pytorch_device), batched_inputs
+            )
+            sample_rng_or_pytorch_device = self._pytorch_device
+
+        sample_kwargs = dict(self._sample_kwargs)
+        if noise is not None:
+            noise = torch.from_numpy(noise).to(self._pytorch_device) if self._is_pytorch_model else jnp.asarray(noise)
+            sample_kwargs["noise"] = noise
+
+        observation = _model.Observation.from_dict(batched_inputs)
+        start_time = time.monotonic()
+        actions = self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs)
+        model_time_ms = (time.monotonic() - start_time) * 1000
+
+        outputs_batched = {"state": batched_inputs["state"], "actions": actions}
+        if self._is_pytorch_model:
+            outputs_batched = jax.tree.map(lambda x: np.asarray(x.detach().cpu()), outputs_batched)
+        else:
+            outputs_batched = jax.tree.map(np.asarray, outputs_batched)
+
+        results = []
+        for i in range(n):
+            per_example_out = self._output_transform(jax.tree.map(lambda x, i=i: x[i], outputs_batched))
+            per_example_out["policy_timing"] = {"infer_ms": model_time_ms, "batch_size": n}
+            results.append(per_example_out)
+        return results
 
     @property
     def metadata(self) -> dict[str, Any]:

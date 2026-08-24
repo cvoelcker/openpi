@@ -22,6 +22,7 @@ def create_trained_policy(
     default_prompt: str | None = None,
     norm_stats: dict[str, transforms.NormStats] | None = None,
     pytorch_device: str | None = None,
+    policy_cls: type[_policy.Policy] = _policy.Policy,
 ) -> _policy.Policy:
     """Create a policy from a trained checkpoint.
 
@@ -37,6 +38,8 @@ def create_trained_policy(
             from the checkpoint directory.
         pytorch_device: Device to use for PyTorch models (e.g., "cpu", "cuda", "cuda:0").
                       If None and is_pytorch=True, will use "cuda" if available, otherwise "cpu".
+        policy_cls: The `Policy` subclass to construct. Defaults to the plain `Policy`; callers
+            decide, since a subclass may need per-task state unrelated to checkpoint loading.
 
     Note:
         The function automatically detects whether the model is PyTorch-based by checking for the
@@ -72,7 +75,7 @@ def create_trained_policy(
         except ImportError:
             pytorch_device = "cpu"
 
-    return _policy.Policy(
+    return policy_cls(
         model,
         transforms=[
             *repack_transforms.inputs,

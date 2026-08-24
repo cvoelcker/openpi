@@ -161,6 +161,37 @@ class _RepHead(nn.Module):
         return _feature_dropout(pooled, self.dropout, deterministic=deterministic, rng=dropout_rng)
 
 
+class _MeanPoolRepHead(nn.Module):
+    """Mask-mean pooling + an MLP: a fixed-pooling alternative to _RepHead, same contract.
+
+    A linear probe recovers psi from these features at R^2 = 0.60 while trained attention-pooled
+    phi explains 0.0014, so the shortfall is optimization, not representation. At depth=0 this
+    head IS that probe. _RepHead stays the default; this is a diagnostic alternative.
+    """
+
+    depth: int
+    embed_dtype: str
+    dropout: float = 0.0
+
+    @nn.compact
+    def __call__(self, memory, memory_mask, *, deterministic: bool = True, dropout_rng=None):
+        memory = memory.astype(self.embed_dtype)
+        m = memory_mask.astype(memory.dtype)[..., None]
+        # Guard the denominator: an all-padding row would otherwise divide by zero.
+        pooled = (memory * m).sum(axis=1) / jnp.maximum(m.sum(axis=1), 1.0)
+        # Mirrors _RepHead's `final_norm`, and not cosmetic: raw gemma hidden states are large
+        # enough that without it phi starts at phi_norm ~4.7e4 against a psi_norm of ~5.
+        pooled, _ = _gemma.RMSNorm(name="pool_norm")(pooled, None)
+        d = pooled.shape[-1]
+        # Prefer depth=0 (the convex case): it gives phi_psi_cossim_centered 0.458 / phi_std
+        # 0.319 against depth 2's 0.076 / 0.045. The residual + pre-norm keep depth>0 merely
+        # unhelpful rather than destructive.
+        for i in range(self.depth):
+            h, _ = _gemma.RMSNorm(name=f"mlp_norm_{i}")(pooled, None)
+            pooled = pooled + nn.Dense(d, name=f"mlp_{i}", dtype=self.embed_dtype)(nn.gelu(h))
+        return _feature_dropout(pooled, self.dropout, deterministic=deterministic, rng=dropout_rng)
+
+
 class Pi0RepBase(_pi0.Pi0):
     """Pi0 backbone plus learned phi/psi readout heads over a layer mix.
 

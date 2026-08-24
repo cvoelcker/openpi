@@ -176,3 +176,9 @@ cython_debug/
 #.idea/
 LIBERO
 *.sif
+
+# Video files (eval rollouts, etc.)
+*.mp4
+
+# mujoco writes this into cwd on every eval run
+MUJOCO_LOG.TXT

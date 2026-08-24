@@ -68,10 +68,32 @@ rlds = [
     "tensorflow-datasets==4.9.9",
 ]
 
+libero = [
+    # LIBERO's own examples/libero/requirements.txt pins numpy==1.22.4 and a torch==1.11.0+cu113-
+    # era robosuite (compiled for a separate Python 3.8 client env) -- badly incompatible with this
+    # project's numpy/torch/jax versions. These packages' actual PyPI metadata bounds are much
+    # looser (e.g. robosuite just wants numpy>=1.13.3, mujoco>=2.3.0), so resolving them here
+    # against the versions this project already pins works fine -- verified by building an
+    # OffScreenRenderEnv and stepping it. Only pulled in via `uv run --group libero
+    # scripts/eval_on_libero.py ...` (or `uv sync --group libero`); not part of the default env.
+    # One-time manual step, not handled by this group: `libero.libero`'s own __init__.py prompts
+    # interactively for a dataset path on first import unless ~/.libero/config.yaml already exists.
+    "libero",
+    "robosuite==1.4.1",
+    "bddl",
+    "future",
+    "easydict",
+    "gym==0.25.2",
+]
+
+[tool.uv]
+override-dependencies = ["ml-dtypes==0.4.1", "tensorstore==0.1.74"]
+
 [tool.uv.sources]
 openpi-client = { workspace = true }
 lerobot = { git = "https://github.com/huggingface/lerobot", rev = "0cf864870cf29f4738d3ade893e6fd13fbd7cdb5" }
 dlimp = { git = "https://github.com/kvablack/dlimp", rev = "ad72ce3a9b414db2185bc0b38461d4101a65477a" }
+libero = { path = "third_party/libero", editable = true }
 
 [tool.uv.workspace]
 members = ["packages/*"]
