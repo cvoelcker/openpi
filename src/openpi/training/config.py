@@ -29,6 +29,7 @@ import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
 import openpi.training.misc.polaris_config as polaris_config
 import openpi.training.misc.roboarena_config as roboarena_config
+import openpi.training.misc.rlt_config as rlt_config
 import openpi.training.optimizer as _optimizer
 import openpi.training.weight_loaders as weight_loaders
 import openpi.transforms as _transforms
@@ -2151,6 +2152,8 @@ _CONFIGS = [
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),
     *polaris_config.get_polaris_configs(),
+    # RLT-encoder + FB-objective arm (see models/pi05fb_rlt.py).
+    *rlt_config.get_rlt_configs(),
 ]
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
