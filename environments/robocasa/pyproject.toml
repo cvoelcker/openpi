@@ -1,0 +1,14 @@
+[project]
+name = "vista-robocasa"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "robocasa",
+    "robosuite",
+]
+
+[tool.uv.sources]
+robosuite = { git = "https://github.com/ARISE-Initiative/robosuite.git", rev = "5ce6643f3092639d08f7b0f90ed1c6a84f50552c" }
+robocasa = { git = "https://github.com/robocasa/robocasa.git", rev = "4f8a2980def75a55dff96b990745b83540425f09" }
